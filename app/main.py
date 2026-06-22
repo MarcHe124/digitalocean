@@ -286,6 +286,9 @@ DASHBOARD_HTML = """
     .status.idle { background: #e8f7f1; color: var(--good); }
     .row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     .row.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .section-head { display: flex; justify-content: space-between; align-items: end; gap: 14px; margin-bottom: 16px; }
+    .section-head h2 { margin: 0; }
+    .compact-select { width: auto; min-width: 150px; }
     label span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     input, select {
       width: 100%;
@@ -314,19 +317,20 @@ DASHBOARD_HTML = """
     .muted { color: var(--muted); }
     .chart-wrap {
       width: 100%;
-      min-height: 260px;
       border: 1px solid #edf0f5;
       border-radius: 6px;
       padding: 12px;
       background: #fbfcff;
     }
-    canvas { width: 100%; height: 220px; display: block; }
-    .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font-size: 13px; }
-    .legend span { display: inline-flex; align-items: center; gap: 6px; }
-    .swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .chart-title { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+    .chart-title strong { color: var(--ink); }
+    canvas { width: 100%; height: 180px; display: block; }
     @media (max-width: 900px) {
       header, main { padding-left: 18px; padding-right: 18px; }
-      .grid, .two, .row, .row.four { grid-template-columns: 1fr; }
+      .grid, .two, .row, .row.four, .charts { grid-template-columns: 1fr; }
+      .section-head { align-items: stretch; flex-direction: column; }
+      .compact-select { width: 100%; }
     }
   </style>
 </head>
@@ -371,14 +375,29 @@ DASHBOARD_HTML = """
       </div>
     </section>
     <section class="panel">
-      <h2>Trends</h2>
-      <div class="chart-wrap">
-        <canvas id="metricsChart" width="1100" height="320"></canvas>
-        <div class="legend">
-          <span><i class="swatch" style="background:#0069ff"></i>Queued</span>
-          <span><i class="swatch" style="background:#6f42c1"></i>Running</span>
-          <span><i class="swatch" style="background:#b25e09"></i>P95 latency</span>
-          <span><i class="swatch" style="background:#b42318"></i>Dead-lettered</span>
+      <div class="section-head">
+        <div>
+          <h2>Trends</h2>
+          <div class="muted">Each chart has its own y-axis and visible time window.</div>
+        </div>
+        <label><span>Time range</span><select id="timeRange" class="compact-select" onchange="drawCharts()"><option value="60000">Last 1 min</option><option value="3600000">Last 1 hour</option><option value="all">All day</option></select></label>
+      </div>
+      <div class="charts">
+        <div class="chart-wrap">
+          <div class="chart-title"><strong>Queued jobs</strong><span>count</span></div>
+          <canvas id="queuedChart" width="520" height="240"></canvas>
+        </div>
+        <div class="chart-wrap">
+          <div class="chart-title"><strong>Running jobs</strong><span>count</span></div>
+          <canvas id="runningChart" width="520" height="240"></canvas>
+        </div>
+        <div class="chart-wrap">
+          <div class="chart-title"><strong>P95 latency</strong><span>seconds</span></div>
+          <canvas id="latencyChart" width="520" height="240"></canvas>
+        </div>
+        <div class="chart-wrap">
+          <div class="chart-title"><strong>Dead-lettered jobs</strong><span>count</span></div>
+          <canvas id="deadChart" width="520" height="240"></canvas>
         </div>
       </div>
     </section>
@@ -413,7 +432,7 @@ DASHBOARD_HTML = """
   <script>
     let currentConfig = {};
     const history = [];
-    const maxHistoryPoints = 120;
+    const maxHistoryPoints = 57600;
     let steadyTimer = null;
     let steadyStopAt = 0;
 
@@ -443,15 +462,30 @@ DASHBOARD_HTML = """
         dead: metrics.queue_depth.dead_lettered
       });
       while (history.length > maxHistoryPoints) history.shift();
-      drawChart();
+      drawCharts();
     }
 
-    function drawChart() {
-      const canvas = document.getElementById("metricsChart");
+    function visibleHistory() {
+      const range = document.getElementById("timeRange").value;
+      if (range === "all") return history;
+      const cutoff = Date.now() - Number(range);
+      return history.filter(point => point.at.getTime() >= cutoff);
+    }
+
+    function drawCharts() {
+      const points = visibleHistory();
+      drawMetricChart("queuedChart", points, point => point.queued, "#0069ff", "count");
+      drawMetricChart("runningChart", points, point => point.running, "#6f42c1", "count");
+      drawMetricChart("latencyChart", points, point => point.p95, "#b25e09", "seconds");
+      drawMetricChart("deadChart", points, point => point.dead, "#b42318", "count");
+    }
+
+    function drawMetricChart(canvasId, points, selector, color, unit) {
+      const canvas = document.getElementById(canvasId);
       const ctx = canvas.getContext("2d");
       const width = canvas.width;
       const height = canvas.height;
-      const padding = {left: 46, right: 18, top: 18, bottom: 34};
+      const padding = {left: 52, right: 16, top: 14, bottom: 30};
       ctx.clearRect(0, 0, width, height);
       ctx.fillStyle = "#fbfcff";
       ctx.fillRect(0, 0, width, height);
@@ -464,36 +498,38 @@ DASHBOARD_HTML = """
         ctx.lineTo(width - padding.right, y);
         ctx.stroke();
       }
-      if (history.length < 2) {
+      if (points.length < 2) {
         ctx.fillStyle = "#667085";
-        ctx.font = "14px system-ui";
+        ctx.font = "13px system-ui";
         ctx.fillText("Waiting for metrics samples...", padding.left, height / 2);
         return;
       }
-      const maxCount = Math.max(1, ...history.flatMap(point => [point.queued, point.running, point.dead]));
-      const maxLatency = Math.max(1, ...history.map(point => point.p95));
-      drawSeries(ctx, width, height, padding, point => point.queued / maxCount, "#0069ff");
-      drawSeries(ctx, width, height, padding, point => point.running / maxCount, "#6f42c1");
-      drawSeries(ctx, width, height, padding, point => point.dead / maxCount, "#b42318");
-      drawSeries(ctx, width, height, padding, point => point.p95 / maxLatency, "#b25e09");
+      const rawMax = Math.max(...points.map(selector));
+      const maxValue = rawMax <= 0 ? 1 : rawMax;
+      drawSeries(ctx, width, height, padding, points, point => selector(point) / maxValue, color);
       ctx.fillStyle = "#667085";
       ctx.font = "12px system-ui";
-      ctx.fillText(`count max ${maxCount}`, 8, padding.top + 10);
-      ctx.fillText(`p95 max ${maxLatency.toFixed(2)}s`, 8, padding.top + 28);
-      const first = history[0].at.toLocaleTimeString();
-      const last = history[history.length - 1].at.toLocaleTimeString();
+      ctx.fillText(formatAxis(maxValue, unit), 8, padding.top + 4);
+      ctx.fillText("0", 26, height - padding.bottom);
+      const first = points[0].at.toLocaleTimeString();
+      const last = points[points.length - 1].at.toLocaleTimeString();
       ctx.fillText(first, padding.left, height - 10);
       ctx.fillText(last, width - padding.right - 80, height - 10);
     }
 
-    function drawSeries(ctx, width, height, padding, selector, color) {
+    function formatAxis(value, unit) {
+      if (unit === "seconds") return `${Number(value).toFixed(2)}s`;
+      return String(Math.ceil(value));
+    }
+
+    function drawSeries(ctx, width, height, padding, points, selector, color) {
       const plotWidth = width - padding.left - padding.right;
       const plotHeight = height - padding.top - padding.bottom;
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.beginPath();
-      history.forEach((point, index) => {
-        const x = padding.left + (plotWidth * index / Math.max(history.length - 1, 1));
+      points.forEach((point, index) => {
+        const x = padding.left + (plotWidth * index / Math.max(points.length - 1, 1));
         const y = padding.top + plotHeight - (plotHeight * Math.max(0, Math.min(1, selector(point))));
         if (index === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
