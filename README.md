@@ -8,6 +8,7 @@ PulseQueue is a production-minded async job processing REST API built for the Di
 - SQLite for quick local development and single-container demos.
 - Postgres support through `DATABASE_URL` for split API/worker deployments.
 - Worker pool with priority-based claiming, exponential backoff, timeout handling, and dead-lettering.
+- Delayed execution and UTC cron-style recurring schedules.
 - Queue operations for depth, cancel, drain, and dead-letter inspection.
 - Structured metrics for queue depth, worker utilization, job latency p50/p95, and dead-letter rate.
 - Built-in operator dashboard at `/dashboard` with load test controls and runtime configuration.
@@ -20,6 +21,8 @@ flowchart LR
     Client[Client] --> API[FastAPI REST API]
     API --> Store[(Job Store: SQLite or Postgres)]
     Worker[Worker Pool] --> Store
+    Worker --> Scheduler[Cron Materializer]
+    Scheduler --> Store
     Worker --> Handler[Pluggable Handler]
     Handler --> Success[Succeeded Result]
     Handler --> Retry[Retry with Backoff]
@@ -149,6 +152,31 @@ Check queue depth:
 curl -s http://127.0.0.1:8000/queue/depth | jq
 ```
 
+`queued` is every job waiting to run. `due_queued` is the subset eligible for immediate claiming, while `scheduled_queued` is the subset whose `run_at` remains in the future.
+
+Submit a delayed job:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"payload":{"action":"echo","source":"delayed"},"run_at":"2026-06-23T18:00:00Z"}'
+```
+
+Create a recurring schedule evaluated in UTC:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/schedules \
+  -H "Content-Type: application/json" \
+  -d '{"name":"five-minute-heartbeat","cron_expression":"*/5 * * * *","payload":{"action":"echo","source":"cron"}}'
+```
+
+Scheduling operations:
+
+- `GET /scheduled-jobs`
+- `GET /schedules`
+- `PATCH /schedules/{schedule_id}` with `{"enabled": false}` or `true`
+- `DELETE /schedules/{schedule_id}`
+
 Create load:
 
 ```bash
@@ -184,6 +212,7 @@ Worker and retry behavior:
 - `WORKER_POLL_INTERVAL_SECONDS`: idle worker polling interval.
 - `WORKER_LEASE_GRACE_SECONDS`: additional time after the per-attempt timeout before a running job is abandoned.
 - `LEASE_REAPER_INTERVAL_SECONDS`: how frequently worker instances check for abandoned jobs.
+- `SCHEDULER_INTERVAL_SECONDS`: how frequently worker instances materialize due recurring occurrences.
 
 Each job can override `max_retries` and `timeout_seconds` in `POST /jobs`. The API validates those values and persists the effective settings on the job record, so worker restarts do not change job semantics.
 
@@ -220,7 +249,7 @@ pytest -q --cov=app --cov-report=term-missing
 docker rm -f pulsequeue-test-postgres
 ```
 
-The suite covers handler unit behavior, API validation and lifecycle operations, retry and timeout handling, dead-lettering, priority ordering, submission idempotency, stale lease recovery, late-worker fencing, concurrent Postgres claims, and shared API/worker persistence.
+The suite covers handler behavior, API lifecycle operations, retry and timeout handling, dead-lettering, priority ordering, delayed execution, recurring schedule materialization, submission idempotency, stale lease recovery, late-worker fencing, concurrent Postgres claims, and shared API/worker persistence.
 
 GitHub Actions runs the full suite against a PostgreSQL 17 service on every push and pull request, enforces at least 75% branch-aware application coverage, and builds the production Docker image.
 
@@ -246,6 +275,30 @@ curl -X POST http://localhost:8000/jobs \
 ```
 
 Repeating the same effective request with the same key returns the original job ID without creating another job. Reusing that key with a different payload or scheduling configuration returns `409 Conflict`. A database unique index makes this safe across concurrent API containers.
+
+## Scheduling Semantics
+
+Delayed jobs are ordinary queued jobs with a future `run_at`; workers cannot claim them early.
+
+Recurring definitions live in `recurring_schedules`. Every Worker may run the scheduler loop, but transactional locks and the unique `(schedule_id, scheduled_for)` index ensure one generated job per cron occurrence. Generated jobs use the normal retry, timeout, lease recovery, result, and DLQ pipeline.
+
+Cron expressions use UTC. The current catch-up behavior gradually materializes missed occurrences after downtime. Timezones, daylight-saving policies, overlap rules, and configurable misfire behavior are future improvements.
+
+## Database
+
+PulseQueue uses one logical application database:
+
+- Local quick mode: one SQLite database file.
+- Production mode: DigitalOcean Managed PostgreSQL 17 `defaultdb`, accessed through a connection pool.
+
+The schema has four application tables: `jobs`, `job_attempts`, `dead_letters`, and `recurring_schedules`. See [Database Schema](docs/database-schema.md) for columns, indexes, and transaction boundaries.
+
+Additional engineering documentation:
+
+- [One-Page Design](docs/one-pager-design.md)
+- [Engineering Trade-offs](docs/tradeoffs.md)
+- [Future Improvements](docs/future-improvements.md)
+- [Implementation Plan](docs/planning.md)
 
 ## High Load Handling
 
@@ -278,8 +331,9 @@ Dashboard demo flow:
 3. Watch queue depth, worker utilization, p95 latency, and dead-letter rate update.
 4. Use the separate trend charts to see queued jobs, running jobs, p95 latency, and dead-lettered jobs over time.
 5. Switch the dashboard time selector between the last minute, last hour, and all-day view.
-6. Increase worker concurrency from the dashboard in single-container mode, or scale the Worker component in DigitalOcean production-style mode.
-7. Observe the queue drain faster and the trend charts flatten.
+6. Create a delayed job and a recurring cron schedule, then inspect both scheduling tables.
+7. Increase worker concurrency from the dashboard in single-container mode, or scale the Worker component in DigitalOcean production-style mode.
+8. Observe the queue drain faster and the trend charts flatten.
 
 DigitalOcean provides infrastructure-level insights, alerts, logs, and uptime checks. PulseQueue adds queue-specific metrics that DigitalOcean does not infer automatically. A production next step would expose Prometheus-format metrics or OpenTelemetry and connect those to Grafana only when custom dashboards and alerts are needed.
 

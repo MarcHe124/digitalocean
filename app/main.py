@@ -1,5 +1,6 @@
 import math
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -16,10 +17,14 @@ from app.models import (
     QueueDepth,
     RuntimeConfig,
     RuntimeConfigPatch,
+    ScheduleCreate,
+    SchedulePatch,
+    ScheduleView,
 )
 from app.repository import IdempotencyConflictError, JobRepository
 from app.repository_factory import create_repository
 from app.settings import Settings, get_settings
+from app.scheduling import InvalidCronExpressionError, next_cron_run
 from app.worker import WorkerPool
 
 
@@ -52,6 +57,7 @@ def create_app(
         poll_interval_seconds=active_settings.worker_poll_interval_seconds,
         lease_grace_seconds=active_settings.worker_lease_grace_seconds,
         lease_reaper_interval_seconds=active_settings.lease_reaper_interval_seconds,
+        scheduler_interval_seconds=active_settings.scheduler_interval_seconds,
     )
 
     @asynccontextmanager
@@ -124,6 +130,53 @@ def create_app(
             raise HTTPException(status_code=404, detail="job not found")
         return JobView(**job)
 
+    @app.get("/scheduled-jobs", response_model=list[JobView])
+    def scheduled_jobs(repo: JobRepository = Depends(get_repo)) -> list[JobView]:
+        return [JobView(**job) for job in repo.list_scheduled_jobs()]
+
+    @app.post("/schedules", response_model=ScheduleView, status_code=201)
+    def create_schedule(
+        request_body: ScheduleCreate,
+        repo: JobRepository = Depends(get_repo),
+        runtime_config: RuntimeConfigStore = Depends(get_config),
+    ) -> ScheduleView:
+        config_view = runtime_config.view()
+        max_retries = request_body.max_retries if request_body.max_retries is not None else config_view.default_max_retries
+        timeout_seconds = (
+            request_body.timeout_seconds
+            if request_body.timeout_seconds is not None
+            else config_view.default_timeout_seconds
+        )
+        if timeout_seconds > config_view.max_timeout_seconds:
+            raise HTTPException(status_code=422, detail=f"timeout_seconds cannot exceed {config_view.max_timeout_seconds}")
+        try:
+            next_cron_run(request_body.cron_expression, datetime.now(timezone.utc))
+        except InvalidCronExpressionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return ScheduleView(
+            **repo.create_schedule(request_body, max_retries=max_retries, timeout_seconds=timeout_seconds)
+        )
+
+    @app.get("/schedules", response_model=list[ScheduleView])
+    def list_schedules(repo: JobRepository = Depends(get_repo)) -> list[ScheduleView]:
+        return [ScheduleView(**schedule) for schedule in repo.list_schedules()]
+
+    @app.patch("/schedules/{schedule_id}", response_model=ScheduleView)
+    def update_schedule(
+        schedule_id: str,
+        patch: SchedulePatch,
+        repo: JobRepository = Depends(get_repo),
+    ) -> ScheduleView:
+        schedule = repo.set_schedule_enabled(schedule_id, patch.enabled)
+        if schedule is None:
+            raise HTTPException(status_code=404, detail="schedule not found")
+        return ScheduleView(**schedule)
+
+    @app.delete("/schedules/{schedule_id}", status_code=204)
+    def delete_schedule(schedule_id: str, repo: JobRepository = Depends(get_repo)) -> None:
+        if not repo.delete_schedule(schedule_id):
+            raise HTTPException(status_code=404, detail="schedule not found")
+
     @app.post("/jobs/{job_id}/cancel", response_model=JobView)
     def cancel_job(job_id: str, repo: JobRepository = Depends(get_repo)) -> JobView:
         job = repo.cancel_job(job_id)
@@ -172,8 +225,8 @@ def create_app(
         oldest_age = repo.oldest_queued_age_seconds()
         suggested = suggest_concurrency(depth, oldest_age, config_view.worker_concurrency)
         utilization = round(pool.busy_workers / config_view.worker_concurrency, 4) if config_view.worker_concurrency else 0.0
-        pressure = "high" if depth.queued > config_view.worker_concurrency * 20 or utilization > 0.8 else "normal"
-        if depth.queued == 0 and utilization == 0:
+        pressure = "high" if depth.due_queued > config_view.worker_concurrency * 20 or utilization > 0.8 else "normal"
+        if depth.due_queued == 0 and utilization == 0:
             pressure = "idle"
         return MetricsView(
             queue_depth=depth,
@@ -214,7 +267,7 @@ def create_app(
 
 
 def suggest_concurrency(depth: QueueDepth, oldest_age: Optional[float], current: int) -> int:
-    by_depth = math.ceil(depth.queued / 25) if depth.queued else 1
+    by_depth = math.ceil(depth.due_queued / 25) if depth.due_queued else 1
     by_age = current + 1 if oldest_age is not None and oldest_age > 5 else current
     return max(1, min(64, max(current, by_depth, by_age)))
 
@@ -275,7 +328,7 @@ DASHBOARD_HTML = """
     }
     h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
     h2 { margin: 0 0 16px; font-size: 16px; letter-spacing: 0; }
-    main { padding: 24px 32px 36px; display: grid; gap: 20px; }
+    main { width: 100%; min-width: 0; padding: 24px 32px 36px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
     .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
     .two { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 20px; }
     .panel, .metric {
@@ -283,6 +336,8 @@ DASHBOARD_HTML = """
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 18px;
+      min-width: 0;
+      max-width: 100%;
     }
     .metric label { color: var(--muted); display: block; font-size: 13px; margin-bottom: 8px; }
     .metric strong { display: block; font-size: 30px; line-height: 1; }
@@ -327,6 +382,7 @@ DASHBOARD_HTML = """
     }
     button.secondary { color: var(--ink); background: #e9eef7; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+    .actions button { width: auto; }
     .kv { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 8px 0; border-bottom: 1px solid #edf0f5; }
     .kv:last-child { border-bottom: 0; }
     .muted { color: var(--muted); }
@@ -341,6 +397,14 @@ DASHBOARD_HTML = """
     .chart-title { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
     .chart-title strong { color: var(--ink); }
     canvas { width: 100%; height: 180px; display: block; }
+    .two > *, .row > * { min-width: 0; }
+    .table-wrap { width: 100%; max-width: 100%; overflow-x: auto; border: 1px solid #edf0f5; border-radius: 6px; }
+    table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #edf0f5; text-align: left; vertical-align: top; }
+    th { color: var(--muted); background: #fbfcff; font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    td code { white-space: nowrap; }
+    .table-action { min-height: 30px; padding: 5px 8px; font-size: 12px; margin-right: 6px; }
     @media (max-width: 900px) {
       header, main { padding-left: 18px; padding-right: 18px; }
       .grid, .two, .row, .row.four, .charts { grid-template-columns: 1fr; }
@@ -368,6 +432,7 @@ DASHBOARD_HTML = """
       <div class="panel">
         <h2>Live Metrics</h2>
         <div class="kv"><span>Worker utilization</span><strong id="utilization">0%</strong></div>
+        <div class="kv"><span>Due / future queued</span><strong id="queueSplit">0 / 0</strong></div>
         <div class="kv"><span>Worker concurrency</span><strong id="concurrency">0</strong></div>
         <div class="kv"><span>Suggested concurrency</span><strong id="suggested">0</strong></div>
         <div class="kv"><span>Latency p50</span><strong id="p50">n/a</strong></div>
@@ -387,6 +452,53 @@ DASHBOARD_HTML = """
           <button class="secondary" onclick="scale(-1)">Scale Down</button>
           <button class="secondary" onclick="scale(1)">Scale Up</button>
         </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <h2>Job Scheduling</h2>
+          <div class="muted">One-time jobs use an absolute UTC time. Cron schedules are evaluated in UTC.</div>
+        </div>
+      </div>
+      <div class="two">
+        <div>
+          <h2>Delayed Job</h2>
+          <div class="row">
+            <label><span>Run no earlier than</span><input id="delayedRunAt" type="datetime-local"></label>
+            <label><span>Priority</span><input id="delayedPriority" type="number" min="-100" max="100" value="0"></label>
+            <label><span>Payload JSON</span><input id="delayedPayload" value='{"action":"echo","source":"delayed"}'></label>
+          </div>
+          <div class="actions" style="margin-top: 14px;">
+            <button onclick="createDelayedJob()">Schedule Job</button>
+          </div>
+        </div>
+        <div>
+          <h2>Recurring Schedule</h2>
+          <div class="row">
+            <label><span>Name</span><input id="scheduleName" value="Heartbeat"></label>
+            <label><span>Cron expression</span><input id="scheduleCron" value="*/5 * * * *"></label>
+            <label><span>Payload JSON</span><input id="schedulePayload" value='{"action":"echo","source":"cron"}'></label>
+          </div>
+          <div class="actions" style="margin-top: 14px;">
+            <button onclick="createSchedule()">Create Schedule</button>
+          </div>
+        </div>
+      </div>
+      <p class="muted" id="scheduleMessage"></p>
+      <h2 style="margin-top: 22px;">Recurring Definitions</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Cron</th><th>Status</th><th>Next run (UTC)</th><th>Last run</th><th>Actions</th></tr></thead>
+          <tbody id="scheduleRows"><tr><td colspan="6" class="muted">No recurring schedules.</td></tr></tbody>
+        </table>
+      </div>
+      <h2 style="margin-top: 22px;">Future Queued Jobs</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Job ID</th><th>Source</th><th>Run at (UTC)</th><th>Priority</th><th>Status</th></tr></thead>
+          <tbody id="scheduledJobRows"><tr><td colspan="5" class="muted">No future jobs.</td></tr></tbody>
+        </table>
       </div>
     </section>
     <section class="panel">
@@ -553,13 +665,19 @@ DASHBOARD_HTML = """
     }
 
     async function refresh() {
-      const [metrics, config] = await Promise.all([jsonFetch("/metrics"), jsonFetch("/config")]);
+      const [metrics, config, schedules, scheduledJobs] = await Promise.all([
+        jsonFetch("/metrics"),
+        jsonFetch("/config"),
+        jsonFetch("/schedules"),
+        jsonFetch("/scheduled-jobs")
+      ]);
       currentConfig = config;
       document.getElementById("queued").textContent = metrics.queue_depth.queued;
       document.getElementById("running").textContent = metrics.queue_depth.running;
       document.getElementById("succeeded").textContent = metrics.queue_depth.succeeded;
       document.getElementById("dead").textContent = metrics.queue_depth.dead_lettered;
       document.getElementById("utilization").textContent = `${Math.round(metrics.worker_utilization * 100)}%`;
+      document.getElementById("queueSplit").textContent = `${metrics.queue_depth.due_queued} / ${metrics.queue_depth.scheduled_queued}`;
       document.getElementById("concurrency").textContent = metrics.worker_concurrency;
       document.getElementById("suggested").textContent = metrics.suggested_worker_concurrency;
       document.getElementById("p50").textContent = fmtSeconds(metrics.job_latency_p50_seconds);
@@ -572,7 +690,125 @@ DASHBOARD_HTML = """
       document.getElementById("maxRetries").value = config.default_max_retries;
       document.getElementById("timeout").value = config.default_timeout_seconds;
       document.getElementById("configConcurrency").value = config.worker_concurrency;
+      renderSchedules(schedules);
+      renderScheduledJobs(scheduledJobs);
       recordMetrics(metrics);
+    }
+
+    function parsePayload(inputId) {
+      return JSON.parse(document.getElementById(inputId).value);
+    }
+
+    function formatUtc(value) {
+      return value ? new Date(value).toISOString().replace(".000Z", "Z") : "never";
+    }
+
+    function renderSchedules(schedules) {
+      const rows = document.getElementById("scheduleRows");
+      if (!schedules.length) {
+        rows.innerHTML = '<tr><td colspan="6" class="muted">No recurring schedules.</td></tr>';
+        return;
+      }
+      rows.innerHTML = schedules.map(schedule => `
+        <tr>
+          <td>${escapeHtml(schedule.name)}</td>
+          <td><code>${escapeHtml(schedule.cron_expression)}</code></td>
+          <td>${schedule.enabled ? "active" : "paused"}</td>
+          <td>${formatUtc(schedule.next_run_at)}</td>
+          <td>${formatUtc(schedule.last_run_at)}</td>
+          <td>
+            <button class="secondary table-action" onclick="setScheduleEnabled('${schedule.id}', ${!schedule.enabled})">${schedule.enabled ? "Pause" : "Resume"}</button>
+            <button class="secondary table-action" onclick="deleteSchedule('${schedule.id}')">Delete</button>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    function renderScheduledJobs(jobs) {
+      const rows = document.getElementById("scheduledJobRows");
+      if (!jobs.length) {
+        rows.innerHTML = '<tr><td colspan="5" class="muted">No future jobs.</td></tr>';
+        return;
+      }
+      rows.innerHTML = jobs.map(job => `
+        <tr>
+          <td><code>${job.id.slice(0, 12)}</code></td>
+          <td>${job.schedule_id ? "recurring" : "one-time"}</td>
+          <td>${formatUtc(job.run_at)}</td>
+          <td>${job.priority}</td>
+          <td>${job.status}</td>
+        </tr>
+      `).join("");
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function createDelayedJob() {
+      try {
+        const localTime = document.getElementById("delayedRunAt").value;
+        if (!localTime) throw new Error("Select a future execution time.");
+        const result = await jsonFetch("/jobs", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            payload: parsePayload("delayedPayload"),
+            priority: Number(document.getElementById("delayedPriority").value),
+            run_at: new Date(localTime).toISOString()
+          })
+        });
+        document.getElementById("scheduleMessage").textContent = `Scheduled job ${result.job_id}.`;
+        await refresh();
+      } catch (error) {
+        document.getElementById("scheduleMessage").textContent = `Scheduling error: ${error.message}`;
+      }
+    }
+
+    async function createSchedule() {
+      try {
+        const result = await jsonFetch("/schedules", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            name: document.getElementById("scheduleName").value,
+            cron_expression: document.getElementById("scheduleCron").value,
+            payload: parsePayload("schedulePayload")
+          })
+        });
+        document.getElementById("scheduleMessage").textContent = `Created recurring schedule ${result.name}.`;
+        await refresh();
+      } catch (error) {
+        document.getElementById("scheduleMessage").textContent = `Schedule error: ${error.message}`;
+      }
+    }
+
+    async function setScheduleEnabled(scheduleId, enabled) {
+      try {
+        await jsonFetch(`/schedules/${scheduleId}`, {
+          method: "PATCH",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled})
+        });
+        await refresh();
+      } catch (error) {
+        document.getElementById("scheduleMessage").textContent = `Schedule update error: ${error.message}`;
+      }
+    }
+
+    async function deleteSchedule(scheduleId) {
+      try {
+        const response = await fetch(`/schedules/${scheduleId}`, {method: "DELETE"});
+        if (!response.ok) throw new Error(await response.text());
+        await refresh();
+      } catch (error) {
+        document.getElementById("scheduleMessage").textContent = `Schedule delete error: ${error.message}`;
+      }
     }
 
     async function saveConfig() {

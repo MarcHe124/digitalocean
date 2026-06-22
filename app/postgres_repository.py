@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import psycopg
 from psycopg.rows import dict_row
 
-from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth
+from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth, ScheduleCreate
 from app.repository import (
     IdempotencyConflictError,
     job_request_fingerprint,
@@ -15,6 +15,7 @@ from app.repository import (
     parse_db_time,
     to_db_time,
 )
+from app.scheduling import next_cron_run
 
 
 class PostgresJobRepository:
@@ -39,6 +40,8 @@ class PostgresJobRepository:
                         id TEXT PRIMARY KEY,
                         idempotency_key TEXT,
                         request_fingerprint TEXT,
+                        schedule_id TEXT,
+                        scheduled_for TEXT,
                         status TEXT NOT NULL,
                         payload TEXT NOT NULL,
                         result TEXT,
@@ -61,6 +64,14 @@ class PostgresJobRepository:
                 )
                 cursor.execute(
                     "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS request_fingerprint TEXT"
+                )
+                cursor.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS schedule_id TEXT")
+                cursor.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS scheduled_for TEXT")
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_schedule_occurrence
+                    ON jobs(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL
+                    """
                 )
                 cursor.execute(
                     """
@@ -103,6 +114,31 @@ class PostgresJobRepository:
                         attempt_count INTEGER NOT NULL,
                         dead_lettered_at TEXT NOT NULL
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS recurring_schedules (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        cron_expression TEXT NOT NULL,
+                        timezone TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        priority INTEGER NOT NULL,
+                        max_retries INTEGER NOT NULL,
+                        timeout_seconds DOUBLE PRECISION NOT NULL,
+                        enabled BOOLEAN NOT NULL,
+                        next_run_at TEXT NOT NULL,
+                        last_run_at TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_recurring_schedules_due
+                    ON recurring_schedules(enabled, next_run_at)
                     """
                 )
             conn.commit()
@@ -229,6 +265,158 @@ class PostgresJobRepository:
                 cursor.execute("SELECT * FROM jobs WHERE idempotency_key = %s", (idempotency_key,))
                 row = cursor.fetchone()
         return self._job_from_row(row) if row else None
+
+    def list_scheduled_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT * FROM jobs
+                    WHERE status = %s AND run_at > %s
+                    ORDER BY run_at ASC
+                    LIMIT %s
+                    """,
+                    (JobStatus.QUEUED.value, to_db_time(now_utc()), limit),
+                )
+                rows = cursor.fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def create_schedule(
+        self,
+        request: ScheduleCreate,
+        max_retries: int,
+        timeout_seconds: float,
+    ) -> Dict[str, Any]:
+        now = now_utc()
+        schedule_id = str(uuid.uuid4())
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO recurring_schedules(
+                        id, name, cron_expression, timezone, payload, priority, max_retries,
+                        timeout_seconds, enabled, next_run_at, last_run_at, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        schedule_id,
+                        request.name,
+                        request.cron_expression,
+                        "UTC",
+                        json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
+                        request.priority,
+                        max_retries,
+                        timeout_seconds,
+                        True,
+                        to_db_time(next_cron_run(request.cron_expression, now)),
+                        None,
+                        to_db_time(now),
+                        to_db_time(now),
+                    ),
+                )
+            conn.commit()
+        return self.get_schedule(schedule_id) or {}
+
+    def get_schedule(self, schedule_id: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM recurring_schedules WHERE id = %s", (schedule_id,))
+                row = cursor.fetchone()
+        return self._schedule_from_row(row) if row else None
+
+    def list_schedules(self) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM recurring_schedules ORDER BY created_at DESC")
+                rows = cursor.fetchall()
+        return [self._schedule_from_row(row) for row in rows]
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> Optional[Dict[str, Any]]:
+        current = self.get_schedule(schedule_id)
+        if current is None:
+            return None
+        now = now_utc()
+        next_run_at = next_cron_run(current["cron_expression"], now) if enabled else current["next_run_at"]
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE recurring_schedules
+                    SET enabled = %s, next_run_at = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (enabled, to_db_time(next_run_at), to_db_time(now), schedule_id),
+                )
+            conn.commit()
+        return self.get_schedule(schedule_id)
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM recurring_schedules WHERE id = %s", (schedule_id,))
+                deleted = cursor.rowcount > 0
+            conn.commit()
+        return deleted
+
+    def materialize_due_schedules(self, limit: int = 100) -> int:
+        now = now_utc()
+        materialized = 0
+        with self.connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT * FROM recurring_schedules
+                        WHERE enabled = TRUE AND next_run_at <= %s
+                        ORDER BY next_run_at ASC
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (to_db_time(now), limit),
+                    )
+                    rows = cursor.fetchall()
+                    for row in rows:
+                        scheduled_for = parse_db_time(row["next_run_at"])
+                        if scheduled_for is None:
+                            continue
+                        cursor.execute(
+                            """
+                            INSERT INTO jobs(
+                                id, schedule_id, scheduled_for, status, payload, priority, max_retries,
+                                timeout_seconds, attempt_count, run_at, created_at, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL DO NOTHING
+                            """,
+                            (
+                                str(uuid.uuid4()),
+                                row["id"],
+                                row["next_run_at"],
+                                JobStatus.QUEUED.value,
+                                row["payload"],
+                                row["priority"],
+                                row["max_retries"],
+                                row["timeout_seconds"],
+                                0,
+                                row["next_run_at"],
+                                to_db_time(now),
+                                to_db_time(now),
+                            ),
+                        )
+                        materialized += cursor.rowcount
+                        cursor.execute(
+                            """
+                            UPDATE recurring_schedules
+                            SET last_run_at = %s, next_run_at = %s, updated_at = %s
+                            WHERE id = %s
+                            """,
+                            (
+                                row["next_run_at"],
+                                to_db_time(next_cron_run(row["cron_expression"], scheduled_for)),
+                                to_db_time(now),
+                                row["id"],
+                            ),
+                        )
+        return materialized
 
     def claim_next_job(self, worker_id: str) -> Optional[Dict[str, Any]]:
         now_s = to_db_time(now_utc())
@@ -523,6 +711,7 @@ class PostgresJobRepository:
             cancelled=counts[JobStatus.CANCELLED.value],
             total=total,
             due_queued=int(due_queued),
+            scheduled_queued=max(counts[JobStatus.QUEUED.value] - int(due_queued), 0),
         )
 
     def list_dead_letters(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -575,8 +764,8 @@ class PostgresJobRepository:
         with self.connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT created_at FROM jobs WHERE status = %s ORDER BY created_at ASC LIMIT 1",
-                    (JobStatus.QUEUED.value,),
+                    "SELECT created_at FROM jobs WHERE status = %s AND run_at <= %s ORDER BY created_at ASC LIMIT 1",
+                    (JobStatus.QUEUED.value, to_db_time(now_utc())),
                 )
                 row = cursor.fetchone()
         if row is None:
@@ -591,6 +780,8 @@ class PostgresJobRepository:
             "id": row["id"],
             "idempotency_key": row["idempotency_key"],
             "request_fingerprint": row["request_fingerprint"],
+            "schedule_id": row["schedule_id"],
+            "scheduled_for": parse_db_time(row["scheduled_for"]),
             "status": row["status"],
             "payload": json.loads(row["payload"]),
             "result": json.loads(row["result"]) if row["result"] else None,
@@ -605,4 +796,21 @@ class PostgresJobRepository:
             "created_at": parse_db_time(row["created_at"]),
             "updated_at": parse_db_time(row["updated_at"]),
             "finished_at": parse_db_time(row["finished_at"]),
+        }
+
+    def _schedule_from_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "cron_expression": row["cron_expression"],
+            "timezone": row["timezone"],
+            "payload": json.loads(row["payload"]),
+            "priority": row["priority"],
+            "max_retries": row["max_retries"],
+            "timeout_seconds": row["timeout_seconds"],
+            "enabled": bool(row["enabled"]),
+            "next_run_at": parse_db_time(row["next_run_at"]),
+            "last_run_at": parse_db_time(row["last_run_at"]),
+            "created_at": parse_db_time(row["created_at"]),
+            "updated_at": parse_db_time(row["updated_at"]),
         }

@@ -24,6 +24,7 @@ class WorkerPool:
         poll_interval_seconds: float,
         lease_grace_seconds: float = 15.0,
         lease_reaper_interval_seconds: float = 5.0,
+        scheduler_interval_seconds: float = 1.0,
         handler: Callable[[Dict, int], Dict] = execute_job,
     ) -> None:
         self.repository = repository
@@ -31,12 +32,15 @@ class WorkerPool:
         self.poll_interval_seconds = poll_interval_seconds
         self.lease_grace_seconds = lease_grace_seconds
         self.lease_reaper_interval_seconds = lease_reaper_interval_seconds
+        self.scheduler_interval_seconds = scheduler_interval_seconds
         self.handler = handler
         self.instance_id = uuid.uuid4().hex[:12]
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
         self._reaper_lock = threading.Lock()
+        self._scheduler_lock = threading.Lock()
         self._last_reaper_run = 0.0
+        self._last_scheduler_run = 0.0
         self._threads = []
         self._busy_workers = 0
         self._started = False
@@ -117,6 +121,7 @@ class WorkerPool:
         while not self._stop_event.is_set():
             if slot > self.desired_concurrency:
                 break
+            self._maybe_materialize_schedules()
             self._maybe_recover_stale_jobs()
             processed = self.process_one(worker_id)
             if processed is None:
@@ -140,6 +145,25 @@ class WorkerPool:
             logger.exception("stale job recovery failed")
         finally:
             self._reaper_lock.release()
+
+    def _maybe_materialize_schedules(self) -> None:
+        now = time.monotonic()
+        if now - self._last_scheduler_run < self.scheduler_interval_seconds:
+            return
+        if not self._scheduler_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if now - self._last_scheduler_run < self.scheduler_interval_seconds:
+                return
+            created = self.repository.materialize_due_schedules()
+            self._last_scheduler_run = now
+            if created:
+                logger.info("materialized recurring jobs count=%s", created)
+        except Exception:
+            logger.exception("recurring schedule materialization failed")
+        finally:
+            self._scheduler_lock.release()
 
     def _run_with_timeout(self, job: Dict, attempt_no: int) -> Dict:
         executor = ThreadPoolExecutor(max_workers=1)
@@ -183,6 +207,7 @@ def main() -> None:
         poll_interval_seconds=settings.worker_poll_interval_seconds,
         lease_grace_seconds=settings.worker_lease_grace_seconds,
         lease_reaper_interval_seconds=settings.lease_reaper_interval_seconds,
+        scheduler_interval_seconds=settings.scheduler_interval_seconds,
     )
     pool.start()
     logger.info("worker pool started", extra={"worker_concurrency": config.view().worker_concurrency})

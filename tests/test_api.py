@@ -98,6 +98,8 @@ def test_dashboard_is_served(client):
     assert response.status_code == 200
     assert "PulseQueue Operator Dashboard" in response.text
     assert "Steady Load Generator" in response.text
+    assert "Job Scheduling" in response.text
+    assert "Recurring Definitions" in response.text
     assert "queuedChart" in response.text
     assert "Last 1 hour" in response.text
 

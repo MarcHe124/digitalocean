@@ -50,6 +50,8 @@ class JobCreated(BaseModel):
 class JobView(BaseModel):
     id: str
     idempotency_key: Optional[str]
+    schedule_id: Optional[str]
+    scheduled_for: Optional[datetime]
     status: JobStatus
     payload: Dict[str, Any]
     result: Optional[Dict[str, Any]]
@@ -75,6 +77,7 @@ class QueueDepth(BaseModel):
     cancelled: int = 0
     total: int = 0
     due_queued: int = 0
+    scheduled_queued: int = 0
 
 
 class RuntimeConfig(BaseModel):
@@ -117,3 +120,32 @@ class LoadTestRequest(BaseModel):
 class LoadTestResponse(BaseModel):
     created: int
     job_ids: List[str]
+
+
+class ScheduleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    cron_expression: str = Field(min_length=5, max_length=120)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    priority: int = Field(default=0, ge=-100, le=100)
+    max_retries: Optional[int] = Field(default=None, ge=0, le=20)
+    timeout_seconds: Optional[float] = Field(default=None, gt=0)
+
+
+class SchedulePatch(BaseModel):
+    enabled: bool
+
+
+class ScheduleView(BaseModel):
+    id: str
+    name: str
+    cron_expression: str
+    timezone: str
+    payload: Dict[str, Any]
+    priority: int
+    max_retries: int
+    timeout_seconds: float
+    enabled: bool
+    next_run_at: datetime
+    last_run_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime

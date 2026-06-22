@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth
+from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth, ScheduleCreate
+from app.scheduling import next_cron_run
 
 
 class IdempotencyConflictError(ValueError):
@@ -70,6 +71,8 @@ class JobRepository:
                         id TEXT PRIMARY KEY,
                         idempotency_key TEXT,
                         request_fingerprint TEXT,
+                        schedule_id TEXT,
+                        scheduled_for TEXT,
                         status TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     result TEXT,
@@ -110,6 +113,25 @@ class JobRepository:
                     attempt_count INTEGER NOT NULL,
                     dead_lettered_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS recurring_schedules (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    cron_expression TEXT NOT NULL,
+                    timezone TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    max_retries INTEGER NOT NULL,
+                    timeout_seconds REAL NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    next_run_at TEXT NOT NULL,
+                    last_run_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_recurring_schedules_due
+                    ON recurring_schedules(enabled, next_run_at);
                 """
             )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
@@ -117,12 +139,20 @@ class JobRepository:
                 conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
             if "request_fingerprint" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN request_fingerprint TEXT")
+            if "schedule_id" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN schedule_id TEXT")
+            if "scheduled_for" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN scheduled_for TEXT")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key "
                 "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
             )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_attempt_unique ON job_attempts(job_id, attempt_no)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_schedule_occurrence "
+                "ON jobs(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL"
             )
 
     def create_job(
@@ -244,6 +274,147 @@ class JobRepository:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
         return self._job_from_row(row) if row else None
+
+    def list_scheduled_jobs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ? AND run_at > ?
+                ORDER BY run_at ASC
+                LIMIT ?
+                """,
+                (JobStatus.QUEUED.value, to_db_time(now_utc()), limit),
+            ).fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def create_schedule(
+        self,
+        request: ScheduleCreate,
+        max_retries: int,
+        timeout_seconds: float,
+    ) -> Dict[str, Any]:
+        now = now_utc()
+        schedule_id = str(uuid.uuid4())
+        next_run_at = next_cron_run(request.cron_expression, now)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO recurring_schedules(
+                    id, name, cron_expression, timezone, payload, priority, max_retries,
+                    timeout_seconds, enabled, next_run_at, last_run_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    schedule_id,
+                    request.name,
+                    request.cron_expression,
+                    "UTC",
+                    json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
+                    request.priority,
+                    max_retries,
+                    timeout_seconds,
+                    1,
+                    to_db_time(next_run_at),
+                    None,
+                    to_db_time(now),
+                    to_db_time(now),
+                ),
+            )
+        return self.get_schedule(schedule_id) or {}
+
+    def get_schedule(self, schedule_id: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM recurring_schedules WHERE id = ?", (schedule_id,)).fetchone()
+        return self._schedule_from_row(row) if row else None
+
+    def list_schedules(self) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM recurring_schedules ORDER BY created_at DESC").fetchall()
+        return [self._schedule_from_row(row) for row in rows]
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> Optional[Dict[str, Any]]:
+        current = self.get_schedule(schedule_id)
+        if current is None:
+            return None
+        now = now_utc()
+        next_run_at = next_cron_run(current["cron_expression"], now) if enabled else current["next_run_at"]
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE recurring_schedules SET enabled = ?, next_run_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    int(enabled),
+                    to_db_time(next_run_at),
+                    to_db_time(now),
+                    schedule_id,
+                ),
+            )
+        return self.get_schedule(schedule_id) if cursor.rowcount else None
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM recurring_schedules WHERE id = ?", (schedule_id,))
+        return cursor.rowcount > 0
+
+    def materialize_due_schedules(self, limit: int = 100) -> int:
+        now = now_utc()
+        materialized = 0
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM recurring_schedules
+                WHERE enabled = 1 AND next_run_at <= ?
+                ORDER BY next_run_at ASC
+                LIMIT ?
+                """,
+                (to_db_time(now), limit),
+            ).fetchall()
+            for row in rows:
+                scheduled_for = parse_db_time(row["next_run_at"])
+                if scheduled_for is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO jobs(
+                        id, schedule_id, scheduled_for, status, payload, priority, max_retries,
+                        timeout_seconds, attempt_count, run_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        row["id"],
+                        row["next_run_at"],
+                        JobStatus.QUEUED.value,
+                        row["payload"],
+                        row["priority"],
+                        row["max_retries"],
+                        row["timeout_seconds"],
+                        0,
+                        row["next_run_at"],
+                        to_db_time(now),
+                        to_db_time(now),
+                    ),
+                )
+                materialized += int(conn.execute("SELECT changes()").fetchone()[0] > 0)
+                conn.execute(
+                    """
+                    UPDATE recurring_schedules
+                    SET last_run_at = ?, next_run_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        row["next_run_at"],
+                        to_db_time(next_cron_run(row["cron_expression"], scheduled_for)),
+                        to_db_time(now),
+                        row["id"],
+                    ),
+                )
+            conn.execute("COMMIT")
+        return materialized
 
     def claim_next_job(self, worker_id: str) -> Optional[Dict[str, Any]]:
         now = now_utc()
@@ -507,6 +678,7 @@ class JobRepository:
             cancelled=counts[JobStatus.CANCELLED.value],
             total=total,
             due_queued=int(due_queued),
+            scheduled_queued=max(counts[JobStatus.QUEUED.value] - int(due_queued), 0),
         )
 
     def list_dead_letters(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -554,8 +726,8 @@ class JobRepository:
     def oldest_queued_age_seconds(self) -> Optional[float]:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT created_at FROM jobs WHERE status = ? ORDER BY created_at ASC LIMIT 1",
-                (JobStatus.QUEUED.value,),
+                "SELECT created_at FROM jobs WHERE status = ? AND run_at <= ? ORDER BY created_at ASC LIMIT 1",
+                (JobStatus.QUEUED.value, to_db_time(now_utc())),
             ).fetchone()
         if row is None:
             return None
@@ -569,6 +741,8 @@ class JobRepository:
             "id": row["id"],
             "idempotency_key": row["idempotency_key"],
             "request_fingerprint": row["request_fingerprint"],
+            "schedule_id": row["schedule_id"],
+            "scheduled_for": parse_db_time(row["scheduled_for"]),
             "status": row["status"],
             "payload": json.loads(row["payload"]),
             "result": json.loads(row["result"]) if row["result"] else None,
@@ -583,4 +757,21 @@ class JobRepository:
             "created_at": parse_db_time(row["created_at"]),
             "updated_at": parse_db_time(row["updated_at"]),
             "finished_at": parse_db_time(row["finished_at"]),
+        }
+
+    def _schedule_from_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "cron_expression": row["cron_expression"],
+            "timezone": row["timezone"],
+            "payload": json.loads(row["payload"]),
+            "priority": row["priority"],
+            "max_retries": row["max_retries"],
+            "timeout_seconds": row["timeout_seconds"],
+            "enabled": bool(row["enabled"]),
+            "next_run_at": parse_db_time(row["next_run_at"]),
+            "last_run_at": parse_db_time(row["last_run_at"]),
+            "created_at": parse_db_time(row["created_at"]),
+            "updated_at": parse_db_time(row["updated_at"]),
         }

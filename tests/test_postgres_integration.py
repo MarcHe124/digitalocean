@@ -28,7 +28,9 @@ def postgres_repository():
     repository = PostgresJobRepository(database_url)
     with repository.connect() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE dead_letters, job_attempts, jobs RESTART IDENTITY CASCADE")
+            cursor.execute(
+                "TRUNCATE TABLE dead_letters, job_attempts, jobs, recurring_schedules RESTART IDENTITY CASCADE"
+            )
         conn.commit()
     return repository
 
@@ -181,3 +183,38 @@ def test_stale_lease_moves_to_dead_letter_when_retry_budget_is_exhausted(postgre
     assert current["attempt_count"] == 1
     assert dead_letters[0]["job_id"] == job["id"]
     assert "lease expired" in dead_letters[0]["last_error"]
+
+
+def test_concurrent_postgres_schedulers_materialize_one_occurrence(postgres_client, postgres_repository):
+    schedule = postgres_client.post(
+        "/schedules",
+        json={
+            "name": "concurrent scheduler",
+            "cron_expression": "* * * * *",
+            "payload": {"action": "echo", "source": "cron"},
+        },
+    ).json()
+    due_at = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    with postgres_repository.connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE recurring_schedules SET next_run_at = %s WHERE id = %s",
+                (to_db_time(due_at), schedule["id"]),
+            )
+        conn.commit()
+
+    barrier = threading.Barrier(2)
+    materialized = []
+
+    def schedule_due_jobs():
+        barrier.wait()
+        materialized.append(postgres_repository.materialize_due_schedules())
+
+    threads = [threading.Thread(target=schedule_due_jobs), threading.Thread(target=schedule_due_jobs)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sum(materialized) == 1
+    assert postgres_repository.queue_depth().total == 1
