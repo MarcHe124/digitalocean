@@ -187,6 +187,9 @@ docs/
 - Done: 添加 `docker-compose.yml`，启动 `api` 和 `worker` 两个服务。
 - Todo: 可选添加 `.do/app.yaml` 部署样例。
 - Done: 本地跑完整测试。
+- Done: 增加 handler unit tests、SQLite API/worker integration tests 和 PostgreSQL 17 integration tests。
+- Done: PostgreSQL integration 覆盖并发 claim、并发 idempotency、lease recovery/fencing 和 DLQ。
+- Done: GitHub Actions 在 push/PR 启动 PostgreSQL 17、运行完整测试、检查 75% coverage 并构建 Docker image。
 - Todo: push 到个人 GitHub。
 - Todo: 最后登出个人账号。
 

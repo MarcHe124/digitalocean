@@ -198,9 +198,31 @@ The dashboard uses these endpoints to adjust retries, timeout, and worker concur
 
 ## Testing
 
+Fast local suite:
+
 ```bash
 pytest -q
 ```
+
+Full suite with PostgreSQL:
+
+```bash
+docker run --rm --name pulsequeue-test-postgres \
+  -e POSTGRES_USER=pulsequeue \
+  -e POSTGRES_PASSWORD=pulsequeue \
+  -e POSTGRES_DB=pulsequeue_test \
+  -p 55432:5432 -d postgres:17
+
+POSTGRES_TEST_URL=postgresql://pulsequeue:pulsequeue@localhost:55432/pulsequeue_test \
+REQUIRE_POSTGRES_TESTS=true \
+pytest -q --cov=app --cov-report=term-missing
+
+docker rm -f pulsequeue-test-postgres
+```
+
+The suite covers handler unit behavior, API validation and lifecycle operations, retry and timeout handling, dead-lettering, priority ordering, submission idempotency, stale lease recovery, late-worker fencing, concurrent Postgres claims, and shared API/worker persistence.
+
+GitHub Actions runs the full suite against a PostgreSQL 17 service on every push and pull request, enforces at least 75% branch-aware application coverage, and builds the production Docker image.
 
 ## At-Least-Once Semantics
 

@@ -7,6 +7,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: pulsequeue
+          POSTGRES_PASSWORD: pulsequeue
+          POSTGRES_DB: pulsequeue_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pulsequeue -d pulsequeue_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_TEST_URL: postgresql://pulsequeue:pulsequeue@localhost:5432/pulsequeue_test
+      REQUIRE_POSTGRES_TESTS: "true"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -21,5 +38,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Run tests
-        run: pytest -q
+      - name: Run full test suite with coverage
+        run: pytest -q --cov=app --cov-report=term-missing --cov-report=xml
+
+      - name: Build production image
+        run: docker build --tag pulsequeue:ci .
