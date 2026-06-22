@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_PATH: /data/pulsequeue.db
+      WORKER_CONCURRENCY: 2
+      AUTO_START_WORKER: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - pulsequeue-data:/data
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      DATABASE_PATH: /data/pulsequeue.db
+      WORKER_CONCURRENCY: 2
+    volumes:
+      - pulsequeue-data:/data
+    depends_on:
+      - api
+
+volumes:
+  pulsequeue-data:

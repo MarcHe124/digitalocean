@@ -25,17 +25,17 @@
 
 ## Phase 0 - 项目准备
 
-状态：In Progress
+状态：Done
 
 - Done: 初始化 git 仓库。
 - Done: 创建 `.gitignore`。
 - Done: 编写 one pager design doc。
 - Done: 编写 planning doc。
 - Done: 规划内置 operator dashboard。
-- Todo: 创建 Python 项目结构。
-- Todo: 添加依赖文件：`pyproject.toml` 或 `requirements.txt`。
-- Todo: 创建 `README.md` 初稿。
-- Todo: 创建 `.github/workflows/ci.yml`。
+- Done: 创建 Python 项目结构。
+- Done: 添加依赖文件：`pyproject.toml`。
+- Done: 创建 `README.md` 初稿。
+- Done: 创建 `.github/workflows/ci.yml`。
 
 建议结构：
 
@@ -63,14 +63,14 @@ docs/
 
 ## Phase 1 - 数据模型和基础 API
 
-状态：Todo
+状态：Done
 
-- Todo: 实现 SQLite 初始化。
-- Todo: 实现 `jobs`, `job_attempts`, `dead_letters` 表。
-- Todo: 实现 `POST /jobs`。
-- Todo: 实现 `GET /jobs/{job_id}`。
-- Todo: 实现 `GET /health`。
-- Todo: API 层校验 `priority`, `max_retries`, `timeout_seconds`, `run_at`。
+- Done: 实现 SQLite 初始化。
+- Done: 实现 `jobs`, `job_attempts`, `dead_letters` 表。
+- Done: 实现 `POST /jobs`。
+- Done: 实现 `GET /jobs/{job_id}`。
+- Done: 实现 `GET /health`。
+- Done: API 层校验 `priority`, `max_retries`, `timeout_seconds`, `run_at`。
 
 验收点：
 
@@ -80,13 +80,13 @@ docs/
 
 ## Phase 2 - Worker 核心
 
-状态：Todo
+状态：Done
 
-- Todo: 实现 atomic claim：按 `priority DESC, run_at ASC, created_at ASC` 取一个 due job。
-- Todo: 实现 job 状态从 `queued -> running -> succeeded`。
-- Todo: 实现 pluggable handler，先支持 `echo`。
-- Todo: 实现 worker 单步函数 `process_one()`，方便测试。
-- Todo: 实现 worker loop，例如 `python -m app.worker`。
+- Done: 实现 atomic claim：按 `priority DESC, run_at ASC, created_at ASC` 取一个 due job。
+- Done: 实现 job 状态从 `queued -> running -> succeeded`。
+- Done: 实现 pluggable handler，先支持 `echo`。
+- Done: 实现 worker 单步函数 `process_one()`，方便测试。
+- Done: 实现 worker loop，例如 `python -m app.worker`。
 
 验收点：
 
@@ -95,14 +95,14 @@ docs/
 
 ## Phase 3 - Retry、Timeout、Dead Letter
 
-状态：Todo
+状态：Done
 
-- Todo: handler 支持模拟失败。
-- Todo: 实现 `attempt_count`。
-- Todo: 实现指数退避 backoff。
-- Todo: 失败但未超过 `max_retries` 时，状态回到 `queued` 并更新 `run_at`。
-- Todo: 超过 `max_retries` 后，状态进入 `dead_lettered` 并写入 `dead_letters`。
-- Todo: timeout 被记录成失败 attempt，并触发 retry 或 dead-letter。
+- Done: handler 支持模拟失败。
+- Done: 实现 `attempt_count`。
+- Done: 实现指数退避 backoff。
+- Done: 失败但未超过 `max_retries` 时，状态回到 `queued` 并更新 `run_at`。
+- Done: 超过 `max_retries` 后，状态进入 `dead_lettered` 并写入 `dead_letters`。
+- Done: timeout 被记录成失败 attempt，并触发 retry 或 dead-letter。
 
 验收点：
 
@@ -112,14 +112,14 @@ docs/
 
 ## Phase 4 - Operational API
 
-状态：Todo
+状态：Done
 
-- Todo: `GET /queue/depth` 返回 queued/running/dead_lettered/succeeded 等计数。
-- Todo: `POST /jobs/{job_id}/cancel` 取消 queued job。
-- Todo: `POST /queue/drain` 取消所有 pending queued job。
-- Todo: `GET /dead-letters` 返回 dead-letter 列表，方便 demo。
-- Todo: `GET /metrics` 返回 queue depth、worker utilization、latency p50/p95、dead-letter rate 的 JSON。
-- Todo: `GET /config` 和 `PATCH /config` 支持 dashboard 调整 retry、timeout、worker concurrency 等运行时配置。
+- Done: `GET /queue/depth` 返回 queued/running/dead_lettered/succeeded 等计数。
+- Done: `POST /jobs/{job_id}/cancel` 取消 queued job。
+- Done: `POST /queue/drain` 取消所有 pending queued job。
+- Done: `GET /dead-letters` 返回 dead-letter 列表，方便 demo。
+- Done: `GET /metrics` 返回 queue depth、worker utilization、latency p50/p95、dead-letter rate 的 JSON。
+- Done: `GET /config` 和 `PATCH /config` 支持 dashboard 调整 retry、timeout、worker concurrency 等运行时配置。
 
 验收点：
 
@@ -129,16 +129,16 @@ docs/
 
 ## Phase 5 - Operator Dashboard
 
-状态：Todo
+状态：Done
 
-- Todo: 实现 `GET /dashboard`，返回一个简单但好看的 operator dashboard。
-- Todo: 展示 queue depth、running/succeeded/failed/dead-lettered counts、worker utilization、latency p50/p95。
-- Todo: 展示当前 retry、timeout、worker concurrency 配置。
-- Todo: 加 load test 控制：生成 100/500/1000 个 jobs。
-- Todo: 支持 echo、flaky、timeout job mix。
-- Todo: 加 worker controls：手动增加/减少本地 worker concurrency。
-- Todo: 展示 scaling decision：当前 concurrency、建议 concurrency、是否处于高压状态。
-- Todo: 说明 DigitalOcean 真正 container scale up 需要 `DIGITALOCEAN_ACCESS_TOKEN` 或 App Platform autoscaling 配置。
+- Done: 实现 `GET /dashboard`，返回一个简单但好看的 operator dashboard。
+- Done: 展示 queue depth、running/succeeded/failed/dead-lettered counts、worker utilization、latency p50/p95。
+- Done: 展示当前 retry、timeout、worker concurrency 配置。
+- Done: 加 load test 控制：生成 100/500/1000 个 jobs。
+- Done: 支持 echo、flaky、timeout job mix。
+- Done: 加 worker controls：手动增加/减少本地 worker concurrency。
+- Done: 展示 scaling decision：当前 concurrency、建议 concurrency、是否处于高压状态。
+- Done: 说明 DigitalOcean 真正 container scale up 需要 `DIGITALOCEAN_ACCESS_TOKEN` 或 App Platform autoscaling 配置。
 
 验收点：
 
@@ -149,13 +149,13 @@ docs/
 
 ## Phase 6 - 测试和 CI
 
-状态：Todo
+状态：Done
 
-- Todo: 补齐 API 集成测试。
-- Todo: 补齐 worker retry/dead-letter 测试。
-- Todo: 补齐 priority/cancel/drain 测试。
-- Todo: 补齐 metrics/config/dashboard smoke test。
-- Todo: 确保 GitHub Actions 跑 `pytest`。
+- Done: 补齐 API 集成测试。
+- Done: 补齐 worker retry/dead-letter 测试。
+- Done: 补齐 priority/cancel/drain 测试。
+- Done: 补齐 metrics/config/dashboard smoke test。
+- Done: 确保 GitHub Actions 跑 `pytest`。
 
 最低测试清单：
 
@@ -172,17 +172,17 @@ docs/
 
 ## Phase 7 - Docker、部署和文档
 
-状态：Todo
+状态：In Progress
 
-- Todo: README 写清楚 setup、run API、run worker、run tests。
-- Todo: README 写清楚 worker configuration。
-- Todo: README 写清楚 high load handling。
-- Todo: README 写清楚 at-least-once 语义。
-- Todo: README 写清楚 dashboard demo flow。
-- Todo: 添加 Dockerfile。
-- Todo: 可选添加 `docker-compose.yml`，启动 `api` 和 `worker` 两个服务。
+- Done: README 写清楚 setup、run API、run worker、run tests。
+- Done: README 写清楚 worker configuration。
+- Done: README 写清楚 high load handling。
+- Done: README 写清楚 at-least-once 语义。
+- Done: README 写清楚 dashboard demo flow。
+- Done: 添加 Dockerfile。
+- Done: 添加 `docker-compose.yml`，启动 `api` 和 `worker` 两个服务。
 - Todo: 可选添加 `.do/app.yaml` 部署样例。
-- Todo: 本地跑完整测试。
+- Done: 本地跑完整测试。
 - Todo: push 到个人 GitHub。
 - Todo: 最后登出个人账号。
 
