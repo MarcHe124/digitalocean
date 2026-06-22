@@ -179,15 +179,15 @@ def create_app(
         runtime_config: RuntimeConfigStore = Depends(get_config),
     ) -> LoadTestResponse:
         config_view = runtime_config.view()
-        job_ids = []
-        for index in range(request_body.count):
-            payload = load_test_payload(request_body.kind, index)
-            job = repo.create_job(
-                JobCreate(payload=payload, priority=request_body.priority),
-                max_retries=config_view.default_max_retries,
-                timeout_seconds=config_view.default_timeout_seconds,
-            )
-            job_ids.append(job["id"])
+        jobs = [
+            JobCreate(payload=load_test_payload(request_body.kind, index), priority=request_body.priority)
+            for index in range(request_body.count)
+        ]
+        job_ids = repo.create_jobs_batch(
+            jobs,
+            max_retries=config_view.default_max_retries,
+            timeout_seconds=config_view.default_timeout_seconds,
+        )
         return LoadTestResponse(created=len(job_ids), job_ids=job_ids)
 
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -208,8 +208,12 @@ def load_test_payload(kind: str, index: int) -> dict:
         return {"action": "echo", "source": "load-test", "index": index}
     if kind == "flaky":
         return {"action": "fail", "failures_before_success": 1, "source": "load-test", "index": index}
+    if kind == "poison":
+        return {"action": "fail", "failures_before_success": 9999, "source": "load-test", "index": index}
     if kind == "timeout":
         return {"action": "sleep", "seconds": 2, "source": "load-test", "index": index}
+    if index % 25 == 0:
+        return {"action": "fail", "failures_before_success": 9999, "source": "load-test", "index": index}
     if index % 10 == 0:
         return {"action": "fail", "failures_before_success": 1, "source": "load-test", "index": index}
     if index % 15 == 0:
@@ -355,8 +359,8 @@ DASHBOARD_HTML = """
     <section class="panel">
       <h2>Load Test</h2>
       <div class="row">
-        <label><span>Job count</span><input id="loadCount" type="number" min="1" max="5000" value="100"></label>
-        <label><span>Job mix</span><select id="loadKind"><option>echo</option><option>flaky</option><option>timeout</option><option>mixed</option></select></label>
+        <label><span>Job count</span><input id="loadCount" type="number" min="1" max="10000" value="100"></label>
+        <label><span>Job mix</span><select id="loadKind"><option>echo</option><option>flaky</option><option>poison</option><option>timeout</option><option>mixed</option></select></label>
         <label><span>Priority</span><input id="loadPriority" type="number" min="-100" max="100" value="0"></label>
       </div>
       <div class="actions" style="margin-top: 14px;">
@@ -371,7 +375,14 @@ DASHBOARD_HTML = """
 
     async function jsonFetch(url, options) {
       const response = await fetch(url, options);
-      if (!response.ok) throw new Error(await response.text());
+      if (!response.ok) {
+        let message = await response.text();
+        try {
+          const parsed = JSON.parse(message);
+          message = Array.isArray(parsed.detail) ? parsed.detail.map(item => item.msg).join("; ") : parsed.detail || message;
+        } catch (_) {}
+        throw new Error(message);
+      }
       return response.json();
     }
 
@@ -402,38 +413,55 @@ DASHBOARD_HTML = """
     }
 
     async function saveConfig() {
-      const payload = {
-        default_max_retries: Number(document.getElementById("maxRetries").value),
-        default_timeout_seconds: Number(document.getElementById("timeout").value),
-        worker_concurrency: Number(document.getElementById("configConcurrency").value)
-      };
-      await jsonFetch("/config", {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
-      document.getElementById("message").textContent = "Configuration saved.";
-      await refresh();
+      try {
+        const payload = {
+          default_max_retries: Number(document.getElementById("maxRetries").value),
+          default_timeout_seconds: Number(document.getElementById("timeout").value),
+          worker_concurrency: Number(document.getElementById("configConcurrency").value)
+        };
+        await jsonFetch("/config", {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+        document.getElementById("message").textContent = "Configuration saved.";
+        await refresh();
+      } catch (error) {
+        document.getElementById("message").textContent = `Config error: ${error.message}`;
+      }
     }
 
     async function scale(delta) {
-      const next = Math.max(1, Math.min(64, Number(currentConfig.worker_concurrency || 1) + delta));
-      await jsonFetch("/config", {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify({worker_concurrency: next})});
-      document.getElementById("message").textContent = `Worker concurrency set to ${next}.`;
-      await refresh();
+      try {
+        const next = Math.max(1, Math.min(64, Number(currentConfig.worker_concurrency || 1) + delta));
+        await jsonFetch("/config", {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify({worker_concurrency: next})});
+        document.getElementById("message").textContent = `Worker concurrency set to ${next}.`;
+        await refresh();
+      } catch (error) {
+        document.getElementById("message").textContent = `Scale error: ${error.message}`;
+      }
     }
 
     async function runLoadTest() {
-      const payload = {
-        count: Number(document.getElementById("loadCount").value),
-        kind: document.getElementById("loadKind").value,
-        priority: Number(document.getElementById("loadPriority").value)
-      };
-      const result = await jsonFetch("/load-test", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
-      document.getElementById("message").textContent = `Created ${result.created} jobs.`;
-      await refresh();
+      try {
+        const payload = {
+          count: Number(document.getElementById("loadCount").value),
+          kind: document.getElementById("loadKind").value,
+          priority: Number(document.getElementById("loadPriority").value)
+        };
+        document.getElementById("message").textContent = "Submitting load test...";
+        const result = await jsonFetch("/load-test", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+        document.getElementById("message").textContent = `Created ${result.created} jobs.`;
+        await refresh();
+      } catch (error) {
+        document.getElementById("message").textContent = `Load test error: ${error.message}`;
+      }
     }
 
     async function drainQueue() {
-      const result = await jsonFetch("/queue/drain", {method: "POST"});
-      document.getElementById("message").textContent = `Cancelled ${result.cancelled} queued jobs.`;
-      await refresh();
+      try {
+        const result = await jsonFetch("/queue/drain", {method: "POST"});
+        document.getElementById("message").textContent = `Cancelled ${result.cancelled} queued jobs.`;
+        await refresh();
+      } catch (error) {
+        document.getElementById("message").textContent = `Drain error: ${error.message}`;
+      }
     }
 
     refresh().catch(console.error);

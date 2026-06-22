@@ -56,6 +56,19 @@ def test_load_test_creates_requested_jobs(client):
     assert client.get("/queue/depth").json()["queued"] == 12
 
 
+def test_load_test_accepts_large_demo_batch(client):
+    response = client.post("/load-test", json={"count": 10000, "kind": "echo"})
+
+    assert response.status_code == 202
+    assert response.json()["created"] == 10000
+
+
+def test_load_test_rejects_over_limit_batch(client):
+    response = client.post("/load-test", json={"count": 10001, "kind": "echo"})
+
+    assert response.status_code == 422
+
+
 def test_dashboard_is_served(client):
     response = client.get("/dashboard")
 

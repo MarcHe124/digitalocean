@@ -107,12 +107,11 @@ class MetricsView(BaseModel):
 
 
 class LoadTestRequest(BaseModel):
-    count: int = Field(default=100, ge=1, le=5000)
-    kind: str = Field(default="echo", pattern="^(echo|flaky|timeout|mixed)$")
+    count: int = Field(default=100, ge=1, le=10000)
+    kind: str = Field(default="echo", pattern="^(echo|flaky|poison|timeout|mixed)$")
     priority: int = Field(default=0, ge=-100, le=100)
 
 
 class LoadTestResponse(BaseModel):
     created: int
     job_ids: List[str]
-

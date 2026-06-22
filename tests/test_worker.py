@@ -80,3 +80,17 @@ def test_metrics_include_scaling_signal(client):
     assert metrics["suggested_worker_concurrency"] >= 2
     assert metrics["pressure"] in {"normal", "high"}
 
+
+def test_poison_load_test_creates_dead_letters(client):
+    response = client.post("/load-test", json={"count": 1, "kind": "poison"})
+    job_id = response.json()["job_ids"][0]
+
+    for _ in range(3):
+        client.app.state.worker_pool.process_one("test-worker")
+        time.sleep(0.03)
+
+    job = client.get(f"/jobs/{job_id}").json()
+    dead_letters = client.get("/dead-letters").json()["dead_letters"]
+
+    assert job["status"] == "dead_lettered"
+    assert dead_letters[0]["job_id"] == job_id

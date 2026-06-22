@@ -96,6 +96,14 @@ curl -s -X POST http://127.0.0.1:8000/load-test \
   -d '{"count":500,"kind":"mixed"}' | jq
 ```
 
+Load test kinds:
+
+- `echo`: all jobs succeed quickly.
+- `flaky`: each job fails once, retries, then succeeds.
+- `poison`: jobs fail until retry exhaustion and move to dead-letter.
+- `timeout`: jobs sleep long enough to exercise timeout behavior when timeout is configured low.
+- `mixed`: combines successful, flaky, timeout, and poison jobs for dashboard demos.
+
 ## Configuration
 
 Global defaults come from environment variables:
@@ -111,6 +119,8 @@ Global defaults come from environment variables:
 - `AUTO_START_WORKER`
 
 Each job can override `max_retries` and `timeout_seconds` in `POST /jobs`. The API validates those values and persists the effective settings on the job record, so worker restarts do not change job semantics.
+
+`AUTO_START_WORKER=true` starts a worker pool inside the API process. Use this for the single-container DigitalOcean demo. Set `AUTO_START_WORKER=false` when API and worker are deployed as separate components, then run the worker with `python -m app.worker`.
 
 Runtime configuration is available through:
 

@@ -91,28 +91,39 @@ class JobRepository:
             )
 
     def create_job(self, request: JobCreate, max_retries: int, timeout_seconds: float) -> Dict[str, Any]:
-        job_id = str(uuid.uuid4())
+        job_ids = self.create_jobs_batch([request], max_retries=max_retries, timeout_seconds=timeout_seconds)
+        return self.get_job(job_ids[0]) or {}
+
+    def create_jobs_batch(self, requests: List[JobCreate], max_retries: int, timeout_seconds: float) -> List[str]:
+        if not requests:
+            return []
         now = now_utc()
-        run_at = request.run_at or now
-        row = {
-            "id": job_id,
-            "status": JobStatus.QUEUED.value,
-            "payload": json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
-            "result": None,
-            "priority": request.priority,
-            "max_retries": max_retries,
-            "timeout_seconds": timeout_seconds,
-            "attempt_count": 0,
-            "last_error": None,
-            "run_at": to_db_time(run_at),
-            "locked_by": None,
-            "locked_at": None,
-            "created_at": to_db_time(now),
-            "updated_at": to_db_time(now),
-            "finished_at": None,
-        }
+        rows = []
+        for request in requests:
+            job_id = str(uuid.uuid4())
+            run_at = request.run_at or now
+            rows.append(
+                {
+                    "id": job_id,
+                    "status": JobStatus.QUEUED.value,
+                    "payload": json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
+                    "result": None,
+                    "priority": request.priority,
+                    "max_retries": max_retries,
+                    "timeout_seconds": timeout_seconds,
+                    "attempt_count": 0,
+                    "last_error": None,
+                    "run_at": to_db_time(run_at),
+                    "locked_by": None,
+                    "locked_at": None,
+                    "created_at": to_db_time(now),
+                    "updated_at": to_db_time(now),
+                    "finished_at": None,
+                }
+            )
         with self.connect() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
                 """
                 INSERT INTO jobs (
                     id, status, payload, result, priority, max_retries, timeout_seconds,
@@ -124,9 +135,10 @@ class JobRepository:
                     :created_at, :updated_at, :finished_at
                 )
                 """,
-                row,
+                rows,
             )
-        return self.get_job(job_id) or {}
+            conn.execute("COMMIT")
+        return [row["id"] for row in rows]
 
     def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self.connect() as conn:
