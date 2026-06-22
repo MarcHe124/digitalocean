@@ -101,13 +101,30 @@ docs/
 - `POST /queue/drain`：取消所有 pending queued job。
 - 可选 `GET /dead-letters`：方便 demo。
 - 可选 `GET /metrics`：返回 queue depth、worker utilization、latency p50/p95、dead-letter rate 的 JSON。
+- 可选 `GET /config` 和 `PATCH /config`：让 dashboard 可以调整 retry、timeout、worker concurrency 等运行时配置。
 
 验收点：
 
 - queue depth 能反映提交、执行、取消后的变化。
 - drain 后 pending queue 归零。
 
-### 2:20 - 2:45 测试和 CI
+### 2:20 - 2:40 Demo Dashboard
+
+- 实现 `GET /dashboard`，返回一个简单但好看的 operator dashboard。
+- 页面展示 queue depth、running/succeeded/failed/dead-lettered counts、worker utilization、latency p50/p95。
+- 页面展示当前 retry、timeout、worker concurrency 配置。
+- 加 load test 控制：生成 100/500/1000 个 jobs，可选择 echo、flaky、timeout job mix。
+- 加 worker controls：手动增加/减少本地 worker concurrency。
+- 展示 scaling decision：当前 concurrency、建议 concurrency、是否处于高压状态。
+- 明确说明：本地可以演示进程内 worker concurrency 调整；DigitalOcean 真正 container scale up 需要 `DIGITALOCEAN_ACCESS_TOKEN` 或 App Platform autoscaling 配置。
+
+验收点：
+
+- 打开 dashboard 可以看到实时指标。
+- 点击 load test 后 queue depth 和 latency 会变化。
+- 调整 config 后新 job 使用新的 retry/timeout/concurrency 配置。
+
+### 2:40 - 2:55 测试和 CI
 
 - 补齐 API 集成测试。
 - 补齐 worker retry/dead-letter 测试。
@@ -125,7 +142,7 @@ docs/
 - cancel queued job。
 - drain queue。
 
-### 2:45 - 3:00 README、图和提交
+### 2:55 - 3:00 README、图和提交
 
 - README 写清楚：
   - setup
@@ -198,6 +215,14 @@ Observability MVP：
 - 实现 `GET /metrics`，返回 structured JSON。
 - 指标包括 `queue_depth`, `worker_utilization`, `job_latency_p50`, `job_latency_p95`, `dead_letter_rate`。
 - README 说明生产版会接 Prometheus/OpenTelemetry + Grafana。
+
+Dashboard demo 策略：
+
+- 优先做内置 dashboard，而不是外接 Grafana；这样不需要额外账号和 key。
+- Dashboard 上有 load test 按钮，可以批量提交 jobs。
+- Dashboard 上有 configuration 表单，可以修改 retry、timeout、worker concurrency。
+- Dashboard 展示 scaling decision：当前 concurrency、建议 concurrency、是否处于高压状态。
+- 本地可以演示进程内 worker concurrency 调整；DigitalOcean 真正 container scale up 需要 `DIGITALOCEAN_ACCESS_TOKEN` 或 App Platform autoscaling 配置。
 
 ## 现场风险和应对
 

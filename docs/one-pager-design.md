@@ -185,6 +185,22 @@ MVP 中用结构化 JSON metrics endpoint 实现可验收的 observability：
 - Grafana 画 queue depth、latency、worker utilization、dead-letter rate。
 - 告警规则：queue depth 持续升高、p95 latency 超阈值、dead-letter rate 超阈值、worker utilization 长时间接近 100%。
 
+## Operator Dashboard
+
+为了让面试 demo 更直观，提供一个轻量 operator dashboard：
+
+- `GET /dashboard` 返回一个内置 HTML 页面，不需要 React build pipeline 或外部 Grafana 账号。
+- 页面轮询 `GET /metrics` 和 `GET /queue/depth`，展示 queue depth、running jobs、succeeded/failed/dead-lettered、worker utilization、latency p50/p95。
+- 配置区允许调整默认 `max_retries`, `timeout_seconds`, `worker_concurrency`, `backoff_base_seconds`，通过 `GET /config` 和 `PATCH /config` 管理运行时配置。
+- Load test 区提供按钮生成大量测试 jobs，例如 100/500/1000 个 echo 或 flaky jobs，用于观察 queue depth 上升、worker busy、latency 变化和 dead-letter 增长。
+- Worker scaling 区展示当前 worker concurrency、建议 concurrency，以及手动调整按钮。MVP 可以在本地进程内调整 worker pool 大小；生产部署时再映射到 DigitalOcean worker component 的 container 数量。
+
+关于 autoscaling 的诚实边界：
+
+- 本地 demo 可以实现 adaptive worker pool：当 queue depth 或 oldest queued age 超过阈值时，提高进程内 worker concurrency；下降后缩回。
+- DigitalOcean App Platform 的真实 worker container 扩容需要平台 autoscaling 或 DigitalOcean API token。没有 token 时，dashboard 只能展示扩容建议和本地 worker concurrency 调整。
+- 如果配置了 `DIGITALOCEAN_ACCESS_TOKEN` 和 app/component id，可以作为 next step 增加一个受保护的 scale endpoint 调用 DigitalOcean API 调整 worker component container 数量。
+
 ## Deployment 和 Autoscaling
 
 本项目自身不直接“检测流量然后自动扩容机器”；它负责暴露指标和健康检查，扩容由部署平台或外部控制器执行。
@@ -208,5 +224,6 @@ MVP 中用结构化 JSON metrics endpoint 实现可验收的 observability：
 1. Dockerfile + docker-compose，把 API 和 worker 分开启动。
 2. `run_at` delayed execution。
 3. lease reaper，恢复卡在 running 的任务。
-4. Prometheus 风格 `/metrics`。
-5. DigitalOcean App Platform 或 Droplet 部署说明。
+4. 内置 operator dashboard，支持 load test 和 runtime config。
+5. Prometheus 风格 `/metrics`。
+6. DigitalOcean App Platform 或 Droplet 部署说明。
