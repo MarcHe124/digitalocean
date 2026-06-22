@@ -100,6 +100,9 @@ def test_dashboard_is_served(client):
     assert "Steady Load Generator" in response.text
     assert "Job Scheduling" in response.text
     assert "Recurring Definitions" in response.text
+    assert "Scale Up" in response.text
+    assert "Scale Down" in response.text
+    assert "Manual, local process" in response.text
     assert "queuedChart" in response.text
     assert "Last 1 hour" in response.text
 

@@ -106,7 +106,6 @@ class MetricsView(BaseModel):
     job_latency_p50_seconds: Optional[float]
     job_latency_p95_seconds: Optional[float]
     dead_letter_rate: float
-    suggested_worker_concurrency: int
     pressure: str
     oldest_queued_age_seconds: Optional[float]
 

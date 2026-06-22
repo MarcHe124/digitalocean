@@ -316,6 +316,7 @@ Scaling guidance:
 
 - Increase worker containers when queue depth or oldest queued age grows.
 - Increase `WORKER_CONCURRENCY` when a worker container has spare CPU and I/O capacity.
+- Automatic scaling is not enabled. The dashboard can manually resize worker threads in the current process; DigitalOcean container scaling remains separate.
 - Keep API containers focused on HTTP traffic by setting `AUTO_START_WORKER=false`.
 - Move from SQLite to Managed Postgres for shared state, then to Redis/RabbitMQ/SQS if queue volume or scheduling semantics outgrow a relational-backed queue.
 - Limit payload size and validate job parameters to protect the API tier.

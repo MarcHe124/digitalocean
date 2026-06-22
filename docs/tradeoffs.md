@@ -38,4 +38,4 @@ The built-in dashboard is portable, requires no external account, and demonstrat
 
 ## Manual Scaling vs Queue-Driven Autoscaling
 
-The dashboard currently changes in-process concurrency and displays a recommendation. A queue-depth controller could update DigitalOcean Worker container count. Only one control loop should own that value; enabling an independent platform CPU autoscaler at the same time risks oscillation and conflicting decisions.
+The current deployment defaults to two worker threads per container. The dashboard can manually resize threads in its current process but does not run an automatic scaling loop or change DigitalOcean container count. A future queue-depth controller could update DigitalOcean Worker container count. Only one control loop should own that value; enabling an independent platform CPU autoscaler at the same time risks oscillation and conflicting decisions.

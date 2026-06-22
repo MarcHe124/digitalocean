@@ -80,7 +80,6 @@ def test_metrics_include_scaling_signal(client):
     metrics = client.get("/metrics").json()
 
     assert metrics["queue_depth"]["queued"] == 30
-    assert metrics["suggested_worker_concurrency"] >= 2
     assert metrics["pressure"] in {"normal", "high"}
 
 

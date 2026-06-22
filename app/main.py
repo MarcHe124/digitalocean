@@ -223,7 +223,6 @@ def create_app(
         completed = depth.succeeded + depth.failed + depth.dead_lettered
         dead_letter_rate = round(depth.dead_lettered / completed, 4) if completed else 0.0
         oldest_age = repo.oldest_queued_age_seconds()
-        suggested = suggest_concurrency(depth, oldest_age, config_view.worker_concurrency)
         utilization = round(pool.busy_workers / config_view.worker_concurrency, 4) if config_view.worker_concurrency else 0.0
         pressure = "high" if depth.due_queued > config_view.worker_concurrency * 20 or utilization > 0.8 else "normal"
         if depth.due_queued == 0 and utilization == 0:
@@ -236,7 +235,6 @@ def create_app(
             job_latency_p50_seconds=percentile(latencies, 0.50),
             job_latency_p95_seconds=percentile(latencies, 0.95),
             dead_letter_rate=dead_letter_rate,
-            suggested_worker_concurrency=suggested,
             pressure=pressure,
             oldest_queued_age_seconds=round(oldest_age, 4) if oldest_age is not None else None,
         )
@@ -264,12 +262,6 @@ def create_app(
         return HTMLResponse(DASHBOARD_HTML)
 
     return app
-
-
-def suggest_concurrency(depth: QueueDepth, oldest_age: Optional[float], current: int) -> int:
-    by_depth = math.ceil(depth.due_queued / 25) if depth.due_queued else 1
-    by_age = current + 1 if oldest_age is not None and oldest_age > 5 else current
-    return max(1, min(64, max(current, by_depth, by_age)))
 
 
 def load_test_payload(kind: str, index: int) -> dict:
@@ -433,8 +425,8 @@ DASHBOARD_HTML = """
         <h2>Live Metrics</h2>
         <div class="kv"><span>Worker utilization</span><strong id="utilization">0%</strong></div>
         <div class="kv"><span>Due / future queued</span><strong id="queueSplit">0 / 0</strong></div>
-        <div class="kv"><span>Worker concurrency</span><strong id="concurrency">0</strong></div>
-        <div class="kv"><span>Suggested concurrency</span><strong id="suggested">0</strong></div>
+        <div class="kv"><span>Configured threads / process</span><strong id="concurrency">0</strong></div>
+        <div class="kv"><span>Scaling mode</span><strong>Manual, local process</strong></div>
         <div class="kv"><span>Latency p50</span><strong id="p50">n/a</strong></div>
         <div class="kv"><span>Latency p95</span><strong id="p95">n/a</strong></div>
         <div class="kv"><span>Dead-letter rate</span><strong id="dlRate">0%</strong></div>
@@ -452,6 +444,7 @@ DASHBOARD_HTML = """
           <button class="secondary" onclick="scale(-1)">Scale Down</button>
           <button class="secondary" onclick="scale(1)">Scale Up</button>
         </div>
+        <p class="muted">Default: 2 threads. In single-container mode these controls resize the active worker pool. In split deployment, scale the Worker component in DigitalOcean.</p>
       </div>
     </section>
     <section class="panel">
@@ -679,7 +672,6 @@ DASHBOARD_HTML = """
       document.getElementById("utilization").textContent = `${Math.round(metrics.worker_utilization * 100)}%`;
       document.getElementById("queueSplit").textContent = `${metrics.queue_depth.due_queued} / ${metrics.queue_depth.scheduled_queued}`;
       document.getElementById("concurrency").textContent = metrics.worker_concurrency;
-      document.getElementById("suggested").textContent = metrics.suggested_worker_concurrency;
       document.getElementById("p50").textContent = fmtSeconds(metrics.job_latency_p50_seconds);
       document.getElementById("p95").textContent = fmtSeconds(metrics.job_latency_p95_seconds);
       document.getElementById("dlRate").textContent = `${Math.round(metrics.dead_letter_rate * 100)}%`;
@@ -828,9 +820,13 @@ DASHBOARD_HTML = """
 
     async function scale(delta) {
       try {
-        const next = Math.max(1, Math.min(64, Number(currentConfig.worker_concurrency || 1) + delta));
-        await jsonFetch("/config", {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify({worker_concurrency: next})});
-        document.getElementById("message").textContent = `Worker concurrency set to ${next}.`;
+        const next = Math.max(1, Math.min(64, Number(currentConfig.worker_concurrency || 2) + delta));
+        await jsonFetch("/config", {
+          method: "PATCH",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({worker_concurrency: next})
+        });
+        document.getElementById("message").textContent = `Active worker threads set to ${next} in this process.`;
         await refresh();
       } catch (error) {
         document.getElementById("message").textContent = `Scale error: ${error.message}`;

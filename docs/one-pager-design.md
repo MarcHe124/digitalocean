@@ -77,7 +77,7 @@ The current catch-up policy materializes missed occurrences gradually, bounded b
 
 ## Observability and Operations
 
-The metrics endpoint reports queue depth, due versus future queued jobs, worker utilization, oldest queued age, latency p50/p95, dead-letter rate, pressure, and suggested in-process concurrency.
+The metrics endpoint reports queue depth, due versus future queued jobs, worker utilization, oldest queued age, latency p50/p95, dead-letter rate, and pressure.
 
 The built-in dashboard supports load generation, runtime configuration, delayed submission, recurring schedule management, and metric trends. Dashboard concurrency controls affect threads inside one process; DigitalOcean container count remains a deployment-platform concern.
 
