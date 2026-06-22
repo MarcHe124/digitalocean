@@ -178,6 +178,10 @@ docs/
 - Done: README 写清楚 worker configuration。
 - Done: README 写清楚 high load handling。
 - Done: README 写清楚 at-least-once 语义。
+- Done: 增加 running job lease reaper，Worker 崩溃后记录 abandoned attempt 并自动重试或进入 DLQ。
+- Done: 增加 lease ownership fencing，阻止过期 Worker 的迟到结果覆盖 replacement attempt。
+- Done: `POST /jobs` 支持 `Idempotency-Key`，数据库层去重并对冲突请求返回 `409`。
+- Done: `(job_id, attempt_no)` 唯一约束用于检测重复 attempt。
 - Done: README 写清楚 dashboard demo flow。
 - Done: 添加 Dockerfile。
 - Done: 添加 `docker-compose.yml`，启动 `api` 和 `worker` 两个服务。

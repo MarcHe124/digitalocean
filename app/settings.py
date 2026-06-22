@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     backoff_base_seconds: float = Field(default=0.25, gt=0, le=60, validation_alias="BACKOFF_BASE_SECONDS")
     backoff_max_seconds: float = Field(default=30.0, gt=0, le=600, validation_alias="BACKOFF_MAX_SECONDS")
     worker_poll_interval_seconds: float = Field(default=0.15, gt=0, le=10, validation_alias="WORKER_POLL_INTERVAL_SECONDS")
+    worker_lease_grace_seconds: float = Field(default=15.0, ge=1, le=600, validation_alias="WORKER_LEASE_GRACE_SECONDS")
+    lease_reaper_interval_seconds: float = Field(
+        default=5.0, ge=0.5, le=60, validation_alias="LEASE_REAPER_INTERVAL_SECONDS"
+    )
     dashboard_enabled: bool = Field(default=True, validation_alias="DASHBOARD_ENABLED")
     auto_start_worker: bool = Field(default=True, validation_alias="AUTO_START_WORKER")
 

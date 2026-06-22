@@ -11,6 +11,29 @@ def test_create_and_get_job(client):
     assert job["attempt_count"] == 0
 
 
+def test_idempotency_key_returns_the_original_job(client):
+    headers = {"Idempotency-Key": "checkout-123"}
+    payload = {"payload": {"action": "echo", "message": "hello"}, "priority": 5}
+
+    first = client.post("/jobs", json=payload, headers=headers)
+    second = client.post("/jobs", json=payload, headers=headers)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["job_id"] == first.json()["job_id"]
+    assert client.get("/queue/depth").json()["total"] == 1
+
+
+def test_idempotency_key_rejects_a_different_request(client):
+    headers = {"Idempotency-Key": "checkout-456"}
+    client.post("/jobs", json={"payload": {"action": "echo", "value": 1}}, headers=headers)
+
+    response = client.post("/jobs", json={"payload": {"action": "echo", "value": 2}}, headers=headers)
+
+    assert response.status_code == 409
+    assert "different request" in response.json()["detail"]
+
+
 def test_rejects_timeout_above_configured_max(client):
     response = client.post("/jobs", json={"payload": {"action": "echo"}, "timeout_seconds": 5})
 

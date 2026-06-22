@@ -26,6 +26,10 @@ services:
         value: "5"
       - key: MAX_TIMEOUT_SECONDS
         value: "60"
+      - key: WORKER_LEASE_GRACE_SECONDS
+        value: "15"
+      - key: LEASE_REAPER_INTERVAL_SECONDS
+        value: "5"
 workers:
   - name: worker
     github:
@@ -48,8 +52,12 @@ workers:
         value: "5"
       - key: MAX_TIMEOUT_SECONDS
         value: "60"
+      - key: WORKER_LEASE_GRACE_SECONDS
+        value: "15"
+      - key: LEASE_REAPER_INTERVAL_SECONDS
+        value: "5"
 databases:
   - name: db
     engine: PG
-    version: "16"
+    version: "17"
     production: false

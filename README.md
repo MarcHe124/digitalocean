@@ -182,6 +182,8 @@ Worker and retry behavior:
 - `BACKOFF_BASE_SECONDS`: base exponential backoff.
 - `BACKOFF_MAX_SECONDS`: max retry delay.
 - `WORKER_POLL_INTERVAL_SECONDS`: idle worker polling interval.
+- `WORKER_LEASE_GRACE_SECONDS`: additional time after the per-attempt timeout before a running job is abandoned.
+- `LEASE_REAPER_INTERVAL_SECONDS`: how frequently worker instances check for abandoned jobs.
 
 Each job can override `max_retries` and `timeout_seconds` in `POST /jobs`. The API validates those values and persists the effective settings on the job record, so worker restarts do not change job semantics.
 
@@ -204,9 +206,24 @@ pytest -q
 
 PulseQueue persists each accepted job before returning `202 Accepted`, then workers atomically claim due queued jobs from the database. SQLite uses a transaction for local demos. Postgres uses row-level locking with `FOR UPDATE SKIP LOCKED`, which allows multiple worker containers to claim different jobs concurrently.
 
-The system provides at-least-once delivery, not exactly-once execution. If a worker crashes after the handler performs an external side effect but before the result is persisted, a production lease reaper could make the job eligible for retry. Handlers should use `job_id` as an idempotency key for external systems.
+Running jobs carry `locked_by` and `locked_at` lease metadata. The lease reaper detects attempts that remain running beyond the job timeout plus `WORKER_LEASE_GRACE_SECONDS`. It records the abandoned attempt, then atomically requeues the job or dead-letters it when the retry budget is exhausted. Completion updates require the current worker to still own the lease, so a late result from an expired worker cannot overwrite a replacement attempt.
 
-Duplicate execution is bounded by `attempt_count`, `max_retries`, and the attempt log. Jobs that exceed retry limits are moved to the dead-letter store instead of disappearing silently.
+The system therefore provides at-least-once delivery, not exactly-once execution. A worker can crash after the handler produces an external side effect but before PulseQueue persists success. The replacement attempt executes the handler again. Handlers should pass `job_id` as an idempotency key to downstream systems or record it in a transactional inbox/outbox table.
+
+Duplicate execution is bounded and detectable through the unique `(job_id, attempt_no)` attempt record, `attempt_count`, `max_retries`, lease ownership fencing, and dead-lettering after the retry budget is exhausted.
+
+## Submission Idempotency
+
+Clients can send an `Idempotency-Key` header with `POST /jobs`:
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: checkout-123' \
+  -d '{"payload":{"action":"echo","order_id":"order-42"}}'
+```
+
+Repeating the same effective request with the same key returns the original job ID without creating another job. Reusing that key with a different payload or scheduling configuration returns `409 Conflict`. A database unique index makes this safe across concurrent API containers.
 
 ## High Load Handling
 

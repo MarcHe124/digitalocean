@@ -8,7 +8,13 @@ import psycopg
 from psycopg.rows import dict_row
 
 from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth
-from app.repository import now_utc, parse_db_time, to_db_time
+from app.repository import (
+    IdempotencyConflictError,
+    job_request_fingerprint,
+    now_utc,
+    parse_db_time,
+    to_db_time,
+)
 
 
 class PostgresJobRepository:
@@ -31,6 +37,8 @@ class PostgresJobRepository:
                     """
                     CREATE TABLE IF NOT EXISTS jobs (
                         id TEXT PRIMARY KEY,
+                        idempotency_key TEXT,
+                        request_fingerprint TEXT,
                         status TEXT NOT NULL,
                         payload TEXT NOT NULL,
                         result TEXT,
@@ -46,6 +54,18 @@ class PostgresJobRepository:
                         updated_at TEXT NOT NULL,
                         finished_at TEXT
                     )
+                    """
+                )
+                cursor.execute(
+                    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT"
+                )
+                cursor.execute(
+                    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS request_fingerprint TEXT"
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key
+                    ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL
                     """
                 )
                 cursor.execute(
@@ -70,6 +90,12 @@ class PostgresJobRepository:
                 )
                 cursor.execute(
                     """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_job_attempt_unique
+                    ON job_attempts(job_id, attempt_no)
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS dead_letters (
                         job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
                         payload TEXT NOT NULL,
@@ -81,9 +107,66 @@ class PostgresJobRepository:
                 )
             conn.commit()
 
-    def create_job(self, request: JobCreate, max_retries: int, timeout_seconds: float) -> Dict[str, Any]:
-        job_ids = self.create_jobs_batch([request], max_retries=max_retries, timeout_seconds=timeout_seconds)
-        return self.get_job(job_ids[0]) or {}
+    def create_job(
+        self,
+        request: JobCreate,
+        max_retries: int,
+        timeout_seconds: float,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        fingerprint = job_request_fingerprint(request, max_retries, timeout_seconds)
+        if idempotency_key:
+            existing = self.get_job_by_idempotency_key(idempotency_key)
+            if existing:
+                if existing["request_fingerprint"] != fingerprint:
+                    raise IdempotencyConflictError("idempotency key was already used with a different request")
+                return existing
+
+        now = now_utc()
+        job_id = str(uuid.uuid4())
+        run_at = request.run_at or now
+        try:
+            with self.connect() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO jobs (
+                            id, idempotency_key, request_fingerprint, status, payload, result, priority,
+                            max_retries, timeout_seconds, attempt_count, last_error, run_at, locked_by,
+                            locked_at, created_at, updated_at, finished_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            job_id,
+                            idempotency_key,
+                            fingerprint,
+                            JobStatus.QUEUED.value,
+                            json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
+                            None,
+                            request.priority,
+                            max_retries,
+                            timeout_seconds,
+                            0,
+                            None,
+                            to_db_time(run_at),
+                            None,
+                            None,
+                            to_db_time(now),
+                            to_db_time(now),
+                            None,
+                        ),
+                    )
+                conn.commit()
+        except psycopg.errors.UniqueViolation:
+            if not idempotency_key:
+                raise
+            existing = self.get_job_by_idempotency_key(idempotency_key)
+            if existing and existing["request_fingerprint"] == fingerprint:
+                return existing
+            raise IdempotencyConflictError("idempotency key was already used with a different request")
+        return self.get_job(job_id) or {}
 
     def create_jobs_batch(self, requests: List[JobCreate], max_retries: int, timeout_seconds: float) -> List[str]:
         if not requests:
@@ -96,6 +179,8 @@ class PostgresJobRepository:
             rows.append(
                 {
                     "id": job_id,
+                    "idempotency_key": None,
+                    "request_fingerprint": None,
                     "status": JobStatus.QUEUED.value,
                     "payload": json.dumps(request.payload, separators=(",", ":"), sort_keys=True),
                     "result": None,
@@ -117,11 +202,11 @@ class PostgresJobRepository:
                 cursor.executemany(
                     """
                     INSERT INTO jobs (
-                        id, status, payload, result, priority, max_retries, timeout_seconds,
+                        id, idempotency_key, request_fingerprint, status, payload, result, priority, max_retries, timeout_seconds,
                         attempt_count, last_error, run_at, locked_by, locked_at,
                         created_at, updated_at, finished_at
                     ) VALUES (
-                        %(id)s, %(status)s, %(payload)s, %(result)s, %(priority)s, %(max_retries)s,
+                        %(id)s, %(idempotency_key)s, %(request_fingerprint)s, %(status)s, %(payload)s, %(result)s, %(priority)s, %(max_retries)s,
                         %(timeout_seconds)s, %(attempt_count)s, %(last_error)s, %(run_at)s,
                         %(locked_by)s, %(locked_at)s, %(created_at)s, %(updated_at)s, %(finished_at)s
                     )
@@ -135,6 +220,13 @@ class PostgresJobRepository:
         with self.connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
+                row = cursor.fetchone()
+        return self._job_from_row(row) if row else None
+
+    def get_job_by_idempotency_key(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM jobs WHERE idempotency_key = %s", (idempotency_key,))
                 row = cursor.fetchone()
         return self._job_from_row(row) if row else None
 
@@ -182,6 +274,30 @@ class PostgresJobRepository:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
+                        UPDATE jobs
+                        SET status = %s, result = %s, attempt_count = %s, last_error = NULL,
+                            locked_by = NULL, locked_at = NULL, updated_at = %s, finished_at = %s
+                        WHERE id = %s AND status = %s AND locked_by = %s
+                        RETURNING *
+                        """,
+                        (
+                            JobStatus.SUCCEEDED.value,
+                            json.dumps(result, separators=(",", ":"), sort_keys=True),
+                            attempt_no,
+                            to_db_time(now),
+                            to_db_time(now),
+                            job_id,
+                            JobStatus.RUNNING.value,
+                            worker_id,
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        cursor.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
+                        current = cursor.fetchone()
+                        return self._job_from_row(current) if current else {}
+                    cursor.execute(
+                        """
                         INSERT INTO job_attempts(job_id, attempt_no, worker_id, status, started_at, finished_at, error)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
@@ -195,24 +311,6 @@ class PostgresJobRepository:
                             None,
                         ),
                     )
-                    cursor.execute(
-                        """
-                        UPDATE jobs
-                        SET status = %s, result = %s, attempt_count = %s, last_error = NULL,
-                            locked_by = NULL, locked_at = NULL, updated_at = %s, finished_at = %s
-                        WHERE id = %s
-                        RETURNING *
-                        """,
-                        (
-                            JobStatus.SUCCEEDED.value,
-                            json.dumps(result, separators=(",", ":"), sort_keys=True),
-                            attempt_no,
-                            to_db_time(now),
-                            to_db_time(now),
-                            job_id,
-                        ),
-                    )
-                    row = cursor.fetchone()
         return self._job_from_row(row)
 
     def mark_failed_attempt(
@@ -238,17 +336,10 @@ class PostgresJobRepository:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
-                        INSERT INTO job_attempts(job_id, attempt_no, worker_id, status, started_at, finished_at, error)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (job["id"], attempt_no, worker_id, attempt_status, to_db_time(started_at), to_db_time(now), error),
-                    )
-                    cursor.execute(
-                        """
                         UPDATE jobs
                         SET status = %s, attempt_count = %s, last_error = %s, run_at = %s,
                             locked_by = NULL, locked_at = NULL, updated_at = %s, finished_at = %s
-                        WHERE id = %s
+                        WHERE id = %s AND status = %s AND locked_by = %s
                         RETURNING *
                         """,
                         (
@@ -259,9 +350,22 @@ class PostgresJobRepository:
                             to_db_time(now),
                             finished_at,
                             job["id"],
+                            JobStatus.RUNNING.value,
+                            worker_id,
                         ),
                     )
                     row = cursor.fetchone()
+                    if row is None:
+                        cursor.execute("SELECT * FROM jobs WHERE id = %s", (job["id"],))
+                        current = cursor.fetchone()
+                        return self._job_from_row(current) if current else {}
+                    cursor.execute(
+                        """
+                        INSERT INTO job_attempts(job_id, attempt_no, worker_id, status, started_at, finished_at, error)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (job["id"], attempt_no, worker_id, attempt_status, to_db_time(started_at), to_db_time(now), error),
+                    )
                     if not will_retry:
                         cursor.execute(
                             """
@@ -282,6 +386,87 @@ class PostgresJobRepository:
                             ),
                         )
         return self._job_from_row(row)
+
+    def recover_stale_jobs(self, lease_grace_seconds: float) -> int:
+        now = now_utc()
+        recovered = 0
+        with self.connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT * FROM jobs
+                        WHERE status = %s AND locked_at IS NOT NULL
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (JobStatus.RUNNING.value,),
+                    )
+                    rows = cursor.fetchall()
+                    for row in rows:
+                        locked_at = parse_db_time(row["locked_at"])
+                        if (
+                            locked_at is None
+                            or (now - locked_at).total_seconds() <= row["timeout_seconds"] + lease_grace_seconds
+                        ):
+                            continue
+                        attempt_no = int(row["attempt_count"]) + 1
+                        error = "worker lease expired before the attempt was committed"
+                        will_retry = attempt_no <= row["max_retries"]
+                        next_status = JobStatus.QUEUED.value if will_retry else JobStatus.DEAD_LETTERED.value
+                        finished_at = None if will_retry else to_db_time(now)
+                        cursor.execute(
+                            """
+                            UPDATE jobs
+                            SET status = %s, attempt_count = %s, last_error = %s, run_at = %s,
+                                locked_by = NULL, locked_at = NULL, updated_at = %s, finished_at = %s
+                            WHERE id = %s AND status = %s AND locked_by = %s AND locked_at = %s
+                            """,
+                            (
+                                next_status,
+                                attempt_no,
+                                error,
+                                to_db_time(now),
+                                to_db_time(now),
+                                finished_at,
+                                row["id"],
+                                JobStatus.RUNNING.value,
+                                row["locked_by"],
+                                row["locked_at"],
+                            ),
+                        )
+                        if cursor.rowcount == 0:
+                            continue
+                        cursor.execute(
+                            """
+                            INSERT INTO job_attempts(
+                                job_id, attempt_no, worker_id, status, started_at, finished_at, error
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                row["id"],
+                                attempt_no,
+                                row["locked_by"],
+                                AttemptStatus.ABANDONED.value,
+                                row["locked_at"],
+                                to_db_time(now),
+                                error,
+                            ),
+                        )
+                        if not will_retry:
+                            cursor.execute(
+                                """
+                                INSERT INTO dead_letters(job_id, payload, last_error, attempt_count, dead_lettered_at)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (job_id) DO UPDATE SET
+                                    payload = EXCLUDED.payload,
+                                    last_error = EXCLUDED.last_error,
+                                    attempt_count = EXCLUDED.attempt_count,
+                                    dead_lettered_at = EXCLUDED.dead_lettered_at
+                                """,
+                                (row["id"], row["payload"], error, attempt_no, to_db_time(now)),
+                            )
+                        recovered += 1
+        return recovered
 
     def cancel_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         now = now_utc()
@@ -404,6 +589,8 @@ class PostgresJobRepository:
     def _job_from_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": row["id"],
+            "idempotency_key": row["idempotency_key"],
+            "request_fingerprint": row["request_fingerprint"],
             "status": row["status"],
             "payload": json.loads(row["payload"]),
             "result": json.loads(row["result"]) if row["result"] else None,

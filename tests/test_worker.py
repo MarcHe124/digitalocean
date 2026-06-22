@@ -1,4 +1,7 @@
 import time
+from datetime import datetime, timedelta, timezone
+
+from app.repository import to_db_time
 
 
 def test_worker_processes_successful_job(client):
@@ -94,3 +97,38 @@ def test_poison_load_test_creates_dead_letters(client):
 
     assert job["status"] == "dead_lettered"
     assert dead_letters[0]["job_id"] == job_id
+
+
+def test_stale_running_job_is_recovered_and_retried(client):
+    job_id = client.post(
+        "/jobs",
+        json={"payload": {"action": "echo", "value": "recovered"}, "max_retries": 1, "timeout_seconds": 0.01},
+    ).json()["job_id"]
+    repository = client.app.state.repository
+    claimed = repository.claim_next_job("crashed-worker")
+    stale_time = to_db_time(datetime.now(timezone.utc) - timedelta(seconds=30))
+    with repository.connect() as conn:
+        conn.execute("UPDATE jobs SET locked_at = ? WHERE id = ?", (stale_time, job_id))
+
+    recovered = repository.recover_stale_jobs(lease_grace_seconds=1)
+    stale_completion = repository.mark_succeeded(
+        job_id,
+        "crashed-worker",
+        1,
+        datetime.now(timezone.utc) - timedelta(seconds=30),
+        {"should_not": "win"},
+    )
+    processed = client.app.state.worker_pool.process_one("replacement-worker")
+
+    assert claimed["status"] == "running"
+    assert recovered == 1
+    assert stale_completion["status"] == "queued"
+    assert processed["status"] == "succeeded"
+    assert processed["attempt_count"] == 2
+    assert processed["result"]["echo"]["value"] == "recovered"
+    with repository.connect() as conn:
+        attempts = conn.execute(
+            "SELECT attempt_no, status FROM job_attempts WHERE job_id = ? ORDER BY attempt_no",
+            (job_id,),
+        ).fetchall()
+    assert [(row["attempt_no"], row["status"]) for row in attempts] == [(1, "abandoned"), (2, "succeeded")]

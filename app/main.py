@@ -2,7 +2,7 @@ import math
 from contextlib import asynccontextmanager
 from typing import Iterator, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config_store import RuntimeConfigStore
@@ -17,7 +17,7 @@ from app.models import (
     RuntimeConfig,
     RuntimeConfigPatch,
 )
-from app.repository import JobRepository
+from app.repository import IdempotencyConflictError, JobRepository
 from app.repository_factory import create_repository
 from app.settings import Settings, get_settings
 from app.worker import WorkerPool
@@ -46,7 +46,13 @@ def create_app(
     active_settings.ensure_data_dir()
     repo = repository or create_repository(active_settings)
     config = RuntimeConfigStore.from_settings(active_settings)
-    worker_pool = WorkerPool(repo, config, poll_interval_seconds=active_settings.worker_poll_interval_seconds)
+    worker_pool = WorkerPool(
+        repo,
+        config,
+        poll_interval_seconds=active_settings.worker_poll_interval_seconds,
+        lease_grace_seconds=active_settings.worker_lease_grace_seconds,
+        lease_reaper_interval_seconds=active_settings.lease_reaper_interval_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Iterator[None]:
@@ -87,6 +93,7 @@ def create_app(
     @app.post("/jobs", response_model=JobCreated, status_code=202)
     def create_job(
         request_body: JobCreate,
+        idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=200),
         repo: JobRepository = Depends(get_repo),
         runtime_config: RuntimeConfigStore = Depends(get_config),
     ) -> JobCreated:
@@ -99,7 +106,15 @@ def create_app(
         )
         if timeout_seconds > config_view.max_timeout_seconds:
             raise HTTPException(status_code=422, detail=f"timeout_seconds cannot exceed {config_view.max_timeout_seconds}")
-        job = repo.create_job(request_body, max_retries=max_retries, timeout_seconds=timeout_seconds)
+        try:
+            job = repo.create_job(
+                request_body,
+                max_retries=max_retries,
+                timeout_seconds=timeout_seconds,
+                idempotency_key=idempotency_key,
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JobCreated(job_id=job["id"], status=job["status"])
 
     @app.get("/jobs/{job_id}", response_model=JobView)

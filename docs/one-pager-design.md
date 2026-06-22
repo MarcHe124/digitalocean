@@ -127,14 +127,17 @@ Backoff 建议：`min(2 ** (attempt_count - 1), 30)` 秒，测试中允许配置
 
 ## At-Least-Once 语义
 
-本设计在单进程或单 SQLite 数据库内提供 best-effort at-least-once：
+系统通过持久化 claim lease 和 stale-job recovery 提供 at-least-once：
 
 - 任务提交和持久化在 HTTP 返回前完成，因此已返回的 `job_id` 不会只存在内存里。
-- Worker claim 使用数据库事务，减少多个 worker 同时拿到同一 queued job 的概率。
-- 执行成功前如果 worker 崩溃，任务可能停留在 `running`。生产版应增加 lease reaper：当 `locked_at` 超过 timeout/lease 后，把任务重新置为 `queued`。
+- Worker claim 使用数据库事务；Postgres 使用 `FOR UPDATE SKIP LOCKED`，防止多个 worker 同时获得同一 queued job。
+- Worker claim 时写入 `locked_by/locked_at`。当运行时间超过 attempt timeout 加 lease grace，reaper 会把该 attempt 记录为 `abandoned`，并重新入队或在重试耗尽后进入 DLQ。
+- Worker 完成时通过 `status=running AND locked_by=current_worker` 条件更新做 fencing；过期 Worker 的迟到结果不能覆盖 replacement attempt。
 - 因为崩溃可能发生在 handler 已产生副作用、但结果尚未持久化之前，所以系统语义是 at-least-once，不是 exactly-once。
-- 重复执行的边界：每个 job 有 `attempt_count` 和 `max_retries` 上限；attempt 记录可用于发现重复执行。
-- 真正生产环境中应要求 handler 支持幂等 key，或者把 `job_id` 作为外部副作用的 idempotency key。
+- 重复执行通过唯一 `(job_id, attempt_no)`、attempt log、lease fencing 和 `max_retries` 限制并可观测。
+- Handler 应把 `job_id` 作为外部副作用的 idempotency key，或使用 transactional inbox/outbox。
+
+API 提交支持 `Idempotency-Key` header。相同 key 与相同有效请求返回原 job；相同 key 与不同请求返回 `409 Conflict`。数据库唯一索引保证多个 API 实例并发提交时也只创建一个 job。
 
 ## 测试策略
 

@@ -22,6 +22,7 @@ class AttemptStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     TIMED_OUT = "timed_out"
+    ABANDONED = "abandoned"
 
 
 class JobCreate(BaseModel):
@@ -48,6 +49,7 @@ class JobCreated(BaseModel):
 
 class JobView(BaseModel):
     id: str
+    idempotency_key: Optional[str]
     status: JobStatus
     payload: Dict[str, Any]
     result: Optional[Dict[str, Any]]

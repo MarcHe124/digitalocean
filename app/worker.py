@@ -1,6 +1,7 @@
 import logging
 import time
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
@@ -21,14 +22,21 @@ class WorkerPool:
         repository: JobRepository,
         config: RuntimeConfigStore,
         poll_interval_seconds: float,
+        lease_grace_seconds: float = 15.0,
+        lease_reaper_interval_seconds: float = 5.0,
         handler: Callable[[Dict, int], Dict] = execute_job,
     ) -> None:
         self.repository = repository
         self.config = config
         self.poll_interval_seconds = poll_interval_seconds
+        self.lease_grace_seconds = lease_grace_seconds
+        self.lease_reaper_interval_seconds = lease_reaper_interval_seconds
         self.handler = handler
+        self.instance_id = uuid.uuid4().hex[:12]
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
+        self._reaper_lock = threading.Lock()
+        self._last_reaper_run = 0.0
         self._threads = []
         self._busy_workers = 0
         self._started = False
@@ -84,7 +92,12 @@ class WorkerPool:
         except TimeoutError:
             return self._record_failure(job, worker_id, attempt_no, started_at, "attempt timed out", timed_out=True)
         except Exception as exc:
-            logger.info("job execution failed", extra={"job_id": job["id"], "attempt": attempt_no, "error": str(exc)})
+            logger.info(
+                "job execution failed job_id=%s attempt=%s error=%s",
+                job["id"],
+                attempt_no,
+                str(exc),
+            )
             return self._record_failure(job, worker_id, attempt_no, started_at, str(exc), timed_out=False)
         finally:
             with self._lock:
@@ -100,13 +113,33 @@ class WorkerPool:
             thread.start()
 
     def _worker_loop(self, slot: int) -> None:
-        worker_id = f"worker-{slot}"
+        worker_id = f"{self.instance_id}-{slot}"
         while not self._stop_event.is_set():
             if slot > self.desired_concurrency:
                 break
+            self._maybe_recover_stale_jobs()
             processed = self.process_one(worker_id)
             if processed is None:
                 self._stop_event.wait(self.poll_interval_seconds)
+
+    def _maybe_recover_stale_jobs(self) -> None:
+        now = time.monotonic()
+        if now - self._last_reaper_run < self.lease_reaper_interval_seconds:
+            return
+        if not self._reaper_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if now - self._last_reaper_run < self.lease_reaper_interval_seconds:
+                return
+            recovered = self.repository.recover_stale_jobs(self.lease_grace_seconds)
+            self._last_reaper_run = now
+            if recovered:
+                logger.warning("recovered stale jobs count=%s", recovered)
+        except Exception:
+            logger.exception("stale job recovery failed")
+        finally:
+            self._reaper_lock.release()
 
     def _run_with_timeout(self, job: Dict, attempt_no: int) -> Dict:
         executor = ThreadPoolExecutor(max_workers=1)
@@ -144,7 +177,13 @@ def main() -> None:
     settings.ensure_data_dir()
     repository = create_repository(settings)
     config = RuntimeConfigStore.from_settings(settings)
-    pool = WorkerPool(repository, config, poll_interval_seconds=settings.worker_poll_interval_seconds)
+    pool = WorkerPool(
+        repository,
+        config,
+        poll_interval_seconds=settings.worker_poll_interval_seconds,
+        lease_grace_seconds=settings.worker_lease_grace_seconds,
+        lease_reaper_interval_seconds=settings.lease_reaper_interval_seconds,
+    )
     pool.start()
     logger.info("worker pool started", extra={"worker_concurrency": config.view().worker_concurrency})
     try:
