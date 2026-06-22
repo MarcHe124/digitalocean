@@ -18,6 +18,7 @@ from app.models import (
     RuntimeConfigPatch,
 )
 from app.repository import JobRepository
+from app.repository_factory import create_repository
 from app.settings import Settings, get_settings
 from app.worker import WorkerPool
 
@@ -43,7 +44,7 @@ def create_app(
     active_settings = settings or get_settings()
     should_start_worker = active_settings.auto_start_worker if start_worker is None else start_worker
     active_settings.ensure_data_dir()
-    repo = repository or JobRepository(active_settings.database_path)
+    repo = repository or create_repository(active_settings)
     config = RuntimeConfigStore.from_settings(active_settings)
     worker_pool = WorkerPool(repo, config, poll_interval_seconds=active_settings.worker_poll_interval_seconds)
 

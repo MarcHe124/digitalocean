@@ -9,6 +9,7 @@ from app.config_store import RuntimeConfigStore
 from app.handler import execute_job
 from app.models import RuntimeConfigPatch
 from app.repository import JobRepository
+from app.repository_factory import create_repository
 from app.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = get_settings()
     settings.ensure_data_dir()
-    repository = JobRepository(settings.database_path)
+    repository = create_repository(settings)
     config = RuntimeConfigStore.from_settings(settings)
     pool = WorkerPool(repository, config, poll_interval_seconds=settings.worker_poll_interval_seconds)
     pool.start()

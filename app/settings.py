@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -8,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True)
 
+    database_url: Optional[str] = Field(default=None, validation_alias="DATABASE_URL")
     database_path: str = Field(default="data/pulsequeue.db", validation_alias="DATABASE_PATH")
     default_max_retries: int = Field(default=3, ge=0, le=20, validation_alias="DEFAULT_MAX_RETRIES")
     default_timeout_seconds: float = Field(default=5.0, gt=0, le=300, validation_alias="DEFAULT_TIMEOUT_SECONDS")
@@ -20,6 +22,8 @@ class Settings(BaseSettings):
     auto_start_worker: bool = Field(default=True, validation_alias="AUTO_START_WORKER")
 
     def ensure_data_dir(self) -> None:
+        if self.database_url:
+            return
         if self.database_path != ":memory:":
             Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
 
