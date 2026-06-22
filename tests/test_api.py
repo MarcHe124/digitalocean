@@ -74,6 +74,8 @@ def test_dashboard_is_served(client):
 
     assert response.status_code == 200
     assert "PulseQueue Operator Dashboard" in response.text
+    assert "Steady Load Generator" in response.text
+    assert "metricsChart" in response.text
 
 
 def test_root_redirects_to_dashboard(client):

@@ -235,10 +235,11 @@ The MVP exposes structured application metrics at `/metrics` and a built-in dash
 Dashboard demo flow:
 
 1. Open `/dashboard`.
-2. Submit a mixed load test.
-3. Watch queue depth, worker utilization, latency, and dead-letter rate update.
-4. Increase worker concurrency from the dashboard in single-container mode, or scale the Worker component in DigitalOcean production-style mode.
-5. Observe the queue drain faster.
+2. Submit a mixed load test or start the steady load generator.
+3. Watch queue depth, worker utilization, p95 latency, and dead-letter rate update.
+4. Use the trend chart to see queued jobs, running jobs, p95 latency, and dead-lettered jobs over time.
+5. Increase worker concurrency from the dashboard in single-container mode, or scale the Worker component in DigitalOcean production-style mode.
+6. Observe the queue drain faster and the trend chart flatten.
 
 DigitalOcean provides infrastructure-level insights, alerts, logs, and uptime checks. PulseQueue adds queue-specific metrics that DigitalOcean does not infer automatically. A production next step would expose Prometheus-format metrics or OpenTelemetry and connect those to Grafana only when custom dashboards and alerts are needed.
 

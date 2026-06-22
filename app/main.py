@@ -285,6 +285,7 @@ DASHBOARD_HTML = """
     .status.high { background: #fff4e5; color: var(--warn); }
     .status.idle { background: #e8f7f1; color: var(--good); }
     .row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .row.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     label span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     input, select {
       width: 100%;
@@ -311,9 +312,21 @@ DASHBOARD_HTML = """
     .kv { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 8px 0; border-bottom: 1px solid #edf0f5; }
     .kv:last-child { border-bottom: 0; }
     .muted { color: var(--muted); }
+    .chart-wrap {
+      width: 100%;
+      min-height: 260px;
+      border: 1px solid #edf0f5;
+      border-radius: 6px;
+      padding: 12px;
+      background: #fbfcff;
+    }
+    canvas { width: 100%; height: 220px; display: block; }
+    .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; color: var(--muted); font-size: 13px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
     @media (max-width: 900px) {
       header, main { padding-left: 18px; padding-right: 18px; }
-      .grid, .two, .row { grid-template-columns: 1fr; }
+      .grid, .two, .row, .row.four { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -358,6 +371,18 @@ DASHBOARD_HTML = """
       </div>
     </section>
     <section class="panel">
+      <h2>Trends</h2>
+      <div class="chart-wrap">
+        <canvas id="metricsChart" width="1100" height="320"></canvas>
+        <div class="legend">
+          <span><i class="swatch" style="background:#0069ff"></i>Queued</span>
+          <span><i class="swatch" style="background:#6f42c1"></i>Running</span>
+          <span><i class="swatch" style="background:#b25e09"></i>P95 latency</span>
+          <span><i class="swatch" style="background:#b42318"></i>Dead-lettered</span>
+        </div>
+      </div>
+    </section>
+    <section class="panel">
       <h2>Load Test</h2>
       <div class="row">
         <label><span>Job count</span><input id="loadCount" type="number" min="1" max="10000" value="100"></label>
@@ -370,9 +395,27 @@ DASHBOARD_HTML = """
       </div>
       <p class="muted" id="message"></p>
     </section>
+    <section class="panel">
+      <h2>Steady Load Generator</h2>
+      <div class="row four">
+        <label><span>Jobs per second</span><input id="steadyRate" type="number" min="1" max="500" value="25"></label>
+        <label><span>Duration seconds</span><input id="steadyDuration" type="number" min="1" max="600" value="60"></label>
+        <label><span>Job mix</span><select id="steadyKind"><option>mixed</option><option>echo</option><option>flaky</option><option>poison</option><option>timeout</option></select></label>
+        <label><span>Priority</span><input id="steadyPriority" type="number" min="-100" max="100" value="0"></label>
+      </div>
+      <div class="actions" style="margin-top: 14px;">
+        <button onclick="startSteadyLoad()">Start Steady Load</button>
+        <button class="secondary" onclick="stopSteadyLoad()">Stop</button>
+      </div>
+      <p class="muted" id="steadyMessage">Idle.</p>
+    </section>
   </main>
   <script>
     let currentConfig = {};
+    const history = [];
+    const maxHistoryPoints = 120;
+    let steadyTimer = null;
+    let steadyStopAt = 0;
 
     async function jsonFetch(url, options) {
       const response = await fetch(url, options);
@@ -389,6 +432,73 @@ DASHBOARD_HTML = """
 
     function fmtSeconds(value) {
       return value === null || value === undefined ? "n/a" : `${Number(value).toFixed(2)}s`;
+    }
+
+    function recordMetrics(metrics) {
+      history.push({
+        at: new Date(),
+        queued: metrics.queue_depth.queued,
+        running: metrics.queue_depth.running,
+        p95: metrics.job_latency_p95_seconds || 0,
+        dead: metrics.queue_depth.dead_lettered
+      });
+      while (history.length > maxHistoryPoints) history.shift();
+      drawChart();
+    }
+
+    function drawChart() {
+      const canvas = document.getElementById("metricsChart");
+      const ctx = canvas.getContext("2d");
+      const width = canvas.width;
+      const height = canvas.height;
+      const padding = {left: 46, right: 18, top: 18, bottom: 34};
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#fbfcff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = "#d8dee9";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i += 1) {
+        const y = padding.top + ((height - padding.top - padding.bottom) * i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y);
+        ctx.lineTo(width - padding.right, y);
+        ctx.stroke();
+      }
+      if (history.length < 2) {
+        ctx.fillStyle = "#667085";
+        ctx.font = "14px system-ui";
+        ctx.fillText("Waiting for metrics samples...", padding.left, height / 2);
+        return;
+      }
+      const maxCount = Math.max(1, ...history.flatMap(point => [point.queued, point.running, point.dead]));
+      const maxLatency = Math.max(1, ...history.map(point => point.p95));
+      drawSeries(ctx, width, height, padding, point => point.queued / maxCount, "#0069ff");
+      drawSeries(ctx, width, height, padding, point => point.running / maxCount, "#6f42c1");
+      drawSeries(ctx, width, height, padding, point => point.dead / maxCount, "#b42318");
+      drawSeries(ctx, width, height, padding, point => point.p95 / maxLatency, "#b25e09");
+      ctx.fillStyle = "#667085";
+      ctx.font = "12px system-ui";
+      ctx.fillText(`count max ${maxCount}`, 8, padding.top + 10);
+      ctx.fillText(`p95 max ${maxLatency.toFixed(2)}s`, 8, padding.top + 28);
+      const first = history[0].at.toLocaleTimeString();
+      const last = history[history.length - 1].at.toLocaleTimeString();
+      ctx.fillText(first, padding.left, height - 10);
+      ctx.fillText(last, width - padding.right - 80, height - 10);
+    }
+
+    function drawSeries(ctx, width, height, padding, selector, color) {
+      const plotWidth = width - padding.left - padding.right;
+      const plotHeight = height - padding.top - padding.bottom;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      history.forEach((point, index) => {
+        const x = padding.left + (plotWidth * index / Math.max(history.length - 1, 1));
+        const y = padding.top + plotHeight - (plotHeight * Math.max(0, Math.min(1, selector(point))));
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
     }
 
     async function refresh() {
@@ -411,6 +521,7 @@ DASHBOARD_HTML = """
       document.getElementById("maxRetries").value = config.default_max_retries;
       document.getElementById("timeout").value = config.default_timeout_seconds;
       document.getElementById("configConcurrency").value = config.worker_concurrency;
+      recordMetrics(metrics);
     }
 
     async function saveConfig() {
@@ -463,6 +574,43 @@ DASHBOARD_HTML = """
       } catch (error) {
         document.getElementById("message").textContent = `Drain error: ${error.message}`;
       }
+    }
+
+    async function startSteadyLoad() {
+      stopSteadyLoad();
+      const rate = Math.max(1, Math.min(500, Number(document.getElementById("steadyRate").value)));
+      const duration = Math.max(1, Math.min(600, Number(document.getElementById("steadyDuration").value)));
+      const kind = document.getElementById("steadyKind").value;
+      const priority = Number(document.getElementById("steadyPriority").value);
+      const batchSize = Math.max(1, Math.ceil(rate / 2));
+      steadyStopAt = Date.now() + duration * 1000;
+      document.getElementById("steadyMessage").textContent = `Running ${rate} jobs/sec for ${duration}s.`;
+      async function tick() {
+        if (Date.now() >= steadyStopAt) {
+          stopSteadyLoad("Completed.");
+          return;
+        }
+        try {
+          await jsonFetch("/load-test", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({count: batchSize, kind, priority})
+          });
+          const remaining = Math.max(0, Math.ceil((steadyStopAt - Date.now()) / 1000));
+          document.getElementById("steadyMessage").textContent = `Running ${rate} jobs/sec. ${remaining}s remaining.`;
+        } catch (error) {
+          stopSteadyLoad(`Stopped: ${error.message}`);
+        }
+      }
+      steadyTimer = setInterval(() => tick().catch(console.error), 500);
+      await tick();
+    }
+
+    function stopSteadyLoad(message = "Stopped.") {
+      if (steadyTimer) clearInterval(steadyTimer);
+      steadyTimer = null;
+      steadyStopAt = 0;
+      document.getElementById("steadyMessage").textContent = message;
     }
 
     refresh().catch(console.error);
