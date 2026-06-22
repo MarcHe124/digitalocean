@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Iterator, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config_store import RuntimeConfigStore
 from app.models import (
@@ -78,6 +78,10 @@ def create_app(
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok"}
+
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        return RedirectResponse(url="/dashboard", status_code=307)
 
     @app.post("/jobs", response_model=JobCreated, status_code=202)
     def create_job(
