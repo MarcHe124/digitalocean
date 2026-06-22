@@ -25,6 +25,7 @@ class WorkerPool:
         lease_grace_seconds: float = 15.0,
         lease_reaper_interval_seconds: float = 5.0,
         scheduler_interval_seconds: float = 1.0,
+        config_sync_interval_seconds: float = 1.0,
         handler: Callable[[Dict, int], Dict] = execute_job,
     ) -> None:
         self.repository = repository
@@ -33,14 +34,17 @@ class WorkerPool:
         self.lease_grace_seconds = lease_grace_seconds
         self.lease_reaper_interval_seconds = lease_reaper_interval_seconds
         self.scheduler_interval_seconds = scheduler_interval_seconds
+        self.config_sync_interval_seconds = config_sync_interval_seconds
         self.handler = handler
         self.instance_id = uuid.uuid4().hex[:12]
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
         self._reaper_lock = threading.Lock()
         self._scheduler_lock = threading.Lock()
+        self._config_sync_lock = threading.Lock()
         self._last_reaper_run = 0.0
         self._last_scheduler_run = 0.0
+        self._last_config_sync = 0.0
         self._threads = []
         self._busy_workers = 0
         self._started = False
@@ -58,6 +62,7 @@ class WorkerPool:
         with self._lock:
             if self._started:
                 return
+            self.config.replace(self.repository.get_runtime_config())
             self._started = True
             self._stop_event.clear()
             self._ensure_threads_locked()
@@ -119,6 +124,7 @@ class WorkerPool:
     def _worker_loop(self, slot: int) -> None:
         worker_id = f"{self.instance_id}-{slot}"
         while not self._stop_event.is_set():
+            self._maybe_sync_runtime_config()
             if slot > self.desired_concurrency:
                 break
             self._maybe_materialize_schedules()
@@ -126,6 +132,32 @@ class WorkerPool:
             processed = self.process_one(worker_id)
             if processed is None:
                 self._stop_event.wait(self.poll_interval_seconds)
+
+    def _maybe_sync_runtime_config(self) -> None:
+        now = time.monotonic()
+        if now - self._last_config_sync < self.config_sync_interval_seconds:
+            return
+        if not self._config_sync_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if now - self._last_config_sync < self.config_sync_interval_seconds:
+                return
+            shared = self.repository.get_runtime_config()
+            changed = shared != self.config.view()
+            self.config.replace(shared)
+            if changed:
+                self.reconcile()
+                logger.info("runtime config synchronized worker_concurrency=%s", shared.worker_concurrency)
+            with self._lock:
+                self._threads = [thread for thread in self._threads if thread.is_alive()]
+                active_threads = len(self._threads)
+            self.repository.heartbeat_worker(self.instance_id, active_threads, self.busy_workers)
+            self._last_config_sync = now
+        except Exception:
+            logger.exception("runtime config synchronization failed")
+        finally:
+            self._config_sync_lock.release()
 
     def _maybe_recover_stale_jobs(self) -> None:
         now = time.monotonic()
@@ -201,6 +233,7 @@ def main() -> None:
     settings.ensure_data_dir()
     repository = create_repository(settings)
     config = RuntimeConfigStore.from_settings(settings)
+    config.replace(repository.initialize_runtime_config(config.view()))
     pool = WorkerPool(
         repository,
         config,
@@ -208,6 +241,7 @@ def main() -> None:
         lease_grace_seconds=settings.worker_lease_grace_seconds,
         lease_reaper_interval_seconds=settings.lease_reaper_interval_seconds,
         scheduler_interval_seconds=settings.scheduler_interval_seconds,
+        config_sync_interval_seconds=settings.config_sync_interval_seconds,
     )
     pool.start()
     logger.info("worker pool started", extra={"worker_concurrency": config.view().worker_concurrency})

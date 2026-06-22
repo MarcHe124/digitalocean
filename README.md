@@ -213,6 +213,7 @@ Worker and retry behavior:
 - `WORKER_LEASE_GRACE_SECONDS`: additional time after the per-attempt timeout before a running job is abandoned.
 - `LEASE_REAPER_INTERVAL_SECONDS`: how frequently worker instances check for abandoned jobs.
 - `SCHEDULER_INTERVAL_SECONDS`: how frequently worker instances materialize due recurring occurrences.
+- `CONFIG_SYNC_INTERVAL_SECONDS`: how frequently Worker containers synchronize shared runtime configuration and heartbeat.
 
 Each job can override `max_retries` and `timeout_seconds` in `POST /jobs`. The API validates those values and persists the effective settings on the job record, so worker restarts do not change job semantics.
 
@@ -223,7 +224,7 @@ Runtime configuration is available through:
 - `GET /config`
 - `PATCH /config`
 
-The dashboard uses these endpoints to adjust retries, timeout, and worker concurrency for the running process.
+The dashboard uses these endpoints to adjust retries, timeout, and desired worker threads per container. Configuration is persisted in the shared database. In split mode, every independent Worker container synchronizes the value and reports its observed thread count through a heartbeat. DigitalOcean container count remains a separate platform control.
 
 ## Testing
 

@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -29,7 +30,8 @@ def postgres_repository():
     with repository.connect() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "TRUNCATE TABLE dead_letters, job_attempts, jobs, recurring_schedules RESTART IDENTITY CASCADE"
+                "TRUNCATE TABLE dead_letters, job_attempts, jobs, recurring_schedules, "
+                "runtime_config, worker_instances RESTART IDENTITY CASCADE"
             )
         conn.commit()
     return repository
@@ -218,3 +220,31 @@ def test_concurrent_postgres_schedulers_materialize_one_occurrence(postgres_clie
 
     assert sum(materialized) == 1
     assert postgres_repository.queue_depth().total == 1
+
+
+def test_split_worker_synchronizes_shared_runtime_config(postgres_client, postgres_repository):
+    worker_config = RuntimeConfigStore.from_settings(
+        Settings(_env_file=None, database_url=postgres_repository.database_url, worker_concurrency=1)
+    )
+    worker = WorkerPool(
+        postgres_repository,
+        worker_config,
+        poll_interval_seconds=0.01,
+        config_sync_interval_seconds=0.1,
+    )
+    worker.start()
+    try:
+        response = postgres_client.patch("/config", json={"worker_concurrency": 3})
+        for _ in range(40):
+            status = postgres_repository.worker_runtime_status()
+            if status["active_threads"] == 3:
+                break
+            time.sleep(0.05)
+
+        assert response.status_code == 200
+        assert worker.desired_concurrency == 3
+        assert status["instances"] == 1
+        assert status["active_threads"] == 3
+    finally:
+        postgres_client.patch("/config", json={"worker_concurrency": 1})
+        worker.stop()

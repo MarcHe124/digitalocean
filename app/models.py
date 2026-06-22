@@ -102,6 +102,9 @@ class MetricsView(BaseModel):
     queue_depth: QueueDepth
     worker_concurrency: int
     busy_workers: int
+    active_worker_instances: int
+    active_worker_threads: int
+    active_busy_threads: int
     worker_utilization: float
     job_latency_p50_seconds: Optional[float]
     job_latency_p95_seconds: Optional[float]

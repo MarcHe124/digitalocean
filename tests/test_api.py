@@ -71,6 +71,31 @@ def test_config_update_affects_new_jobs(client):
     assert job["timeout_seconds"] == 0.4
 
 
+def test_shared_config_resizes_active_local_worker_pool(client):
+    pool = client.app.state.worker_pool
+    pool.start()
+
+    response = client.patch("/config", json={"worker_concurrency": 3})
+    for _ in range(30):
+        status = client.app.state.repository.worker_runtime_status()
+        if status["active_threads"] == 3:
+            break
+        time.sleep(0.05)
+
+    assert response.status_code == 200
+    assert response.json()["worker_concurrency"] == 3
+    assert status["instances"] == 1
+    assert status["active_threads"] == 3
+
+    client.patch("/config", json={"worker_concurrency": 1})
+    for _ in range(30):
+        status = client.app.state.repository.worker_runtime_status()
+        if status["active_threads"] == 1:
+            break
+        time.sleep(0.05)
+    assert status["active_threads"] == 1
+
+
 def test_load_test_creates_requested_jobs(client):
     response = client.post("/load-test", json={"count": 12, "kind": "mixed"})
 
@@ -102,7 +127,7 @@ def test_dashboard_is_served(client):
     assert "Recurring Definitions" in response.text
     assert "Scale Up" in response.text
     assert "Scale Down" in response.text
-    assert "Manual, local process" in response.text
+    assert "Manual, shared config" in response.text
     assert "queuedChart" in response.text
     assert "Last 1 hour" in response.text
 
@@ -112,3 +137,4 @@ def test_root_redirects_to_dashboard(client):
 
     assert response.status_code == 307
     assert response.headers["location"] == "/dashboard"
+import time

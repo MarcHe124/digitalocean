@@ -51,3 +51,8 @@ class RuntimeConfigStore:
                 self.backoff_base_seconds = self.backoff_max_seconds
             return self.view()
 
+    def replace(self, config: RuntimeConfig) -> RuntimeConfig:
+        with self._lock:
+            for key, value in config.model_dump().items():
+                setattr(self, key, value)
+            return self.view()

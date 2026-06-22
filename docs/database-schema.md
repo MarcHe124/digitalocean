@@ -6,7 +6,7 @@ The production cluster catalog currently contains:
 
 - `defaultdb`: PulseQueue application database.
 - `_dodb`: DigitalOcean-managed internal database; the application does not use it.
-- `public`: application schema containing the four PulseQueue tables.
+- `public`: application schema containing the PulseQueue data-plane and control-plane tables.
 - `pg_catalog` and `information_schema`: PostgreSQL system metadata schemas.
 
 ## `jobs`
@@ -63,6 +63,26 @@ Durable templates for cron-generated jobs.
 - Creation and update timestamps
 
 The due index is `(enabled, next_run_at)`. Generated jobs intentionally keep `schedule_id` as historical metadata without a foreign key, so deleting a schedule does not erase or invalidate prior executions.
+
+## `runtime_config`
+
+The single-row shared control-plane configuration.
+
+- Stores retry, timeout, backoff, and desired worker threads per container as validated JSON.
+- The API updates it transactionally with row locking.
+- API and Worker processes read the same value, so split deployments share configuration.
+- Environment variables provide the initial defaults only; the database value survives component restarts.
+
+## `worker_instances`
+
+Ephemeral Worker heartbeat records.
+
+- `instance_id`: unique Worker process identifier.
+- `active_threads`: currently observed threads in that Worker process.
+- `busy_threads`: currently executing threads.
+- `last_seen_at`: heartbeat timestamp used to exclude stale instances.
+
+The dashboard compares desired threads per container from `runtime_config` with observed instances and threads from fresh heartbeat rows.
 
 ## Transaction Boundaries
 

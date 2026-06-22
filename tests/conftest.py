@@ -23,6 +23,7 @@ def client(tmp_path):
         backoff_base_seconds=0.01,
         backoff_max_seconds=0.02,
         worker_poll_interval_seconds=0.01,
+        config_sync_interval_seconds=0.1,
     )
     app = create_app(settings=settings, start_worker=False)
     with TestClient(app) as test_client:

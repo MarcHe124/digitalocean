@@ -38,6 +38,22 @@
 - Add payload size limits, schema/version validation, encryption, secret references, and sandboxed execution.
 - Add DLQ replay, quarantine, bulk remediation, and root-cause grouping.
 
+## Security and Abuse Prevention
+
+- Require authentication for every API and dashboard route; use short-lived workload identities for API, Worker, Scheduler, and administrative components.
+- Add role-based authorization so job submission, payload inspection, configuration changes, scaling, DLQ replay, and schedule administration are separate permissions.
+- Protect `PATCH /config`, load generation, drain, cancellation, and scaling controls with administrative authorization and immutable audit records.
+- Enforce tenant isolation in every query and index. Consider database row-level security as defense in depth, not the sole authorization layer.
+- Apply per-tenant rate limits, queue quotas, payload size limits, schedule limits, and concurrency budgets to prevent denial of service and noisy-neighbor behavior.
+- Validate payload schemas and content types, reject unsafe object deserialization, and never execute arbitrary customer code inside the control-plane process.
+- Run untrusted handlers in isolated sandboxes with restricted CPU, memory, filesystem, network egress, syscall, and execution-time policies.
+- Store secrets in DigitalOcean secret variables or a dedicated secret manager; use references in job payloads instead of embedding credentials.
+- Encrypt traffic with TLS, encrypt sensitive payloads at rest, rotate database/API credentials, and redact secrets and personal data from logs and metrics.
+- Add CSRF protection for browser sessions, strict CORS and Content Security Policy, secure cookies, and anti-clickjacking headers.
+- Produce tamper-resistant audit logs for submissions, configuration changes, schedule edits, scaling actions, cancellation, and DLQ replay.
+- Add dependency and container scanning, signed images, SBOM generation, least-privilege database roles, and automated credential rotation.
+- Define data retention, deletion, residency, and incident-response processes before offering the service as a multi-tenant platform.
+
 ## Observability and SLOs
 
 - Instrument OpenTelemetry traces across submission, queue wait, attempts, downstream calls, and completion.

@@ -7,10 +7,11 @@ from typing import Any, Dict, Iterator, List, Optional
 import psycopg
 from psycopg.rows import dict_row
 
-from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth, ScheduleCreate
+from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth, RuntimeConfig, RuntimeConfigPatch, ScheduleCreate
 from app.repository import (
     IdempotencyConflictError,
     job_request_fingerprint,
+    merge_runtime_config,
     now_utc,
     parse_db_time,
     to_db_time,
@@ -141,7 +142,101 @@ class PostgresJobRepository:
                     ON recurring_schedules(enabled, next_run_at)
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_config (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        config_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_instances (
+                        instance_id TEXT PRIMARY KEY,
+                        active_threads INTEGER NOT NULL,
+                        busy_threads INTEGER NOT NULL,
+                        last_seen_at TEXT NOT NULL
+                    )
+                    """
+                )
             conn.commit()
+
+    def initialize_runtime_config(self, default: RuntimeConfig) -> RuntimeConfig:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO runtime_config(id, config_json, updated_at)
+                    VALUES (1, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (default.model_dump_json(), to_db_time(now_utc())),
+                )
+            conn.commit()
+        return self.get_runtime_config()
+
+    def get_runtime_config(self) -> RuntimeConfig:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT config_json FROM runtime_config WHERE id = 1")
+                row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("runtime configuration is not initialized")
+        return RuntimeConfig.model_validate_json(row["config_json"])
+
+    def patch_runtime_config(self, patch: RuntimeConfigPatch) -> RuntimeConfig:
+        with self.connect() as conn:
+            with conn.transaction():
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT config_json FROM runtime_config WHERE id = 1 FOR UPDATE")
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise RuntimeError("runtime configuration is not initialized")
+                    updated = merge_runtime_config(RuntimeConfig.model_validate_json(row["config_json"]), patch)
+                    cursor.execute(
+                        "UPDATE runtime_config SET config_json = %s, updated_at = %s WHERE id = 1",
+                        (updated.model_dump_json(), to_db_time(now_utc())),
+                    )
+        return updated
+
+    def heartbeat_worker(self, instance_id: str, active_threads: int, busy_threads: int) -> None:
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO worker_instances(instance_id, active_threads, busy_threads, last_seen_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (instance_id) DO UPDATE SET
+                        active_threads = EXCLUDED.active_threads,
+                        busy_threads = EXCLUDED.busy_threads,
+                        last_seen_at = EXCLUDED.last_seen_at
+                    """,
+                    (instance_id, active_threads, busy_threads, to_db_time(now_utc())),
+                )
+            conn.commit()
+
+    def worker_runtime_status(self, max_age_seconds: float = 10.0) -> Dict[str, int]:
+        cutoff = to_db_time(datetime.fromtimestamp(now_utc().timestamp() - max_age_seconds, tz=timezone.utc))
+        with self.connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS instances,
+                           COALESCE(SUM(active_threads), 0) AS active_threads,
+                           COALESCE(SUM(busy_threads), 0) AS busy_threads
+                    FROM worker_instances
+                    WHERE last_seen_at >= %s
+                    """,
+                    (cutoff,),
+                )
+                row = cursor.fetchone()
+        return {
+            "instances": int(row["instances"]),
+            "active_threads": int(row["active_threads"]),
+            "busy_threads": int(row["busy_threads"]),
+        }
 
     def create_job(
         self,

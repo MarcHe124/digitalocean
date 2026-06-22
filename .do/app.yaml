@@ -32,6 +32,8 @@ services:
         value: "5"
       - key: SCHEDULER_INTERVAL_SECONDS
         value: "1"
+      - key: CONFIG_SYNC_INTERVAL_SECONDS
+        value: "1"
 workers:
   - name: worker
     github:
@@ -59,6 +61,8 @@ workers:
       - key: LEASE_REAPER_INTERVAL_SECONDS
         value: "5"
       - key: SCHEDULER_INTERVAL_SECONDS
+        value: "1"
+      - key: CONFIG_SYNC_INTERVAL_SECONDS
         value: "1"
 databases:
   - name: db

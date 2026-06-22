@@ -51,6 +51,7 @@ def create_app(
     active_settings.ensure_data_dir()
     repo = repository or create_repository(active_settings)
     config = RuntimeConfigStore.from_settings(active_settings)
+    config.replace(repo.initialize_runtime_config(config.view()))
     worker_pool = WorkerPool(
         repo,
         config,
@@ -58,6 +59,7 @@ def create_app(
         lease_grace_seconds=active_settings.worker_lease_grace_seconds,
         lease_reaper_interval_seconds=active_settings.lease_reaper_interval_seconds,
         scheduler_interval_seconds=active_settings.scheduler_interval_seconds,
+        config_sync_interval_seconds=active_settings.config_sync_interval_seconds,
     )
 
     @asynccontextmanager
@@ -198,16 +200,21 @@ def create_app(
         return {"dead_letters": repo.list_dead_letters()}
 
     @app.get("/config", response_model=RuntimeConfig)
-    def read_config(runtime_config: RuntimeConfigStore = Depends(get_config)) -> RuntimeConfig:
-        return runtime_config.view()
+    def read_config(
+        repo: JobRepository = Depends(get_repo),
+        runtime_config: RuntimeConfigStore = Depends(get_config),
+    ) -> RuntimeConfig:
+        return runtime_config.replace(repo.get_runtime_config())
 
     @app.patch("/config", response_model=RuntimeConfig)
     def update_config(
         patch: RuntimeConfigPatch,
+        repo: JobRepository = Depends(get_repo),
         runtime_config: RuntimeConfigStore = Depends(get_config),
         pool: WorkerPool = Depends(get_worker_pool),
     ) -> RuntimeConfig:
-        updated = runtime_config.patch(patch)
+        updated = repo.patch_runtime_config(patch)
+        runtime_config.replace(updated)
         pool.reconcile()
         return updated
 
@@ -218,12 +225,15 @@ def create_app(
         pool: WorkerPool = Depends(get_worker_pool),
     ) -> MetricsView:
         depth = repo.queue_depth()
-        config_view = runtime_config.view()
+        config_view = runtime_config.replace(repo.get_runtime_config())
+        worker_status = repo.worker_runtime_status()
         latencies = repo.latency_seconds()
         completed = depth.succeeded + depth.failed + depth.dead_lettered
         dead_letter_rate = round(depth.dead_lettered / completed, 4) if completed else 0.0
         oldest_age = repo.oldest_queued_age_seconds()
-        utilization = round(pool.busy_workers / config_view.worker_concurrency, 4) if config_view.worker_concurrency else 0.0
+        observed_busy = worker_status["busy_threads"] or pool.busy_workers
+        observed_threads = worker_status["active_threads"] or config_view.worker_concurrency
+        utilization = round(observed_busy / observed_threads, 4) if observed_threads else 0.0
         pressure = "high" if depth.due_queued > config_view.worker_concurrency * 20 or utilization > 0.8 else "normal"
         if depth.due_queued == 0 and utilization == 0:
             pressure = "idle"
@@ -231,6 +241,9 @@ def create_app(
             queue_depth=depth,
             worker_concurrency=config_view.worker_concurrency,
             busy_workers=pool.busy_workers,
+            active_worker_instances=worker_status["instances"],
+            active_worker_threads=worker_status["active_threads"],
+            active_busy_threads=worker_status["busy_threads"],
             worker_utilization=utilization,
             job_latency_p50_seconds=percentile(latencies, 0.50),
             job_latency_p95_seconds=percentile(latencies, 0.95),
@@ -426,7 +439,9 @@ DASHBOARD_HTML = """
         <div class="kv"><span>Worker utilization</span><strong id="utilization">0%</strong></div>
         <div class="kv"><span>Due / future queued</span><strong id="queueSplit">0 / 0</strong></div>
         <div class="kv"><span>Configured threads / process</span><strong id="concurrency">0</strong></div>
-        <div class="kv"><span>Scaling mode</span><strong>Manual, local process</strong></div>
+        <div class="kv"><span>Active worker containers</span><strong id="workerInstances">0</strong></div>
+        <div class="kv"><span>Observed worker threads</span><strong id="activeThreads">0</strong></div>
+        <div class="kv"><span>Scaling mode</span><strong>Manual, shared config</strong></div>
         <div class="kv"><span>Latency p50</span><strong id="p50">n/a</strong></div>
         <div class="kv"><span>Latency p95</span><strong id="p95">n/a</strong></div>
         <div class="kv"><span>Dead-letter rate</span><strong id="dlRate">0%</strong></div>
@@ -444,7 +459,7 @@ DASHBOARD_HTML = """
           <button class="secondary" onclick="scale(-1)">Scale Down</button>
           <button class="secondary" onclick="scale(1)">Scale Up</button>
         </div>
-        <p class="muted">Default: 2 threads. In single-container mode these controls resize the active worker pool. In split deployment, scale the Worker component in DigitalOcean.</p>
+        <p class="muted">Default: 2 threads per Worker container. This changes threads inside each container; DigitalOcean container count remains separate.</p>
       </div>
     </section>
     <section class="panel">
@@ -672,6 +687,8 @@ DASHBOARD_HTML = """
       document.getElementById("utilization").textContent = `${Math.round(metrics.worker_utilization * 100)}%`;
       document.getElementById("queueSplit").textContent = `${metrics.queue_depth.due_queued} / ${metrics.queue_depth.scheduled_queued}`;
       document.getElementById("concurrency").textContent = metrics.worker_concurrency;
+      document.getElementById("workerInstances").textContent = metrics.active_worker_instances;
+      document.getElementById("activeThreads").textContent = metrics.active_worker_threads;
       document.getElementById("p50").textContent = fmtSeconds(metrics.job_latency_p50_seconds);
       document.getElementById("p95").textContent = fmtSeconds(metrics.job_latency_p95_seconds);
       document.getElementById("dlRate").textContent = `${Math.round(metrics.dead_letter_rate * 100)}%`;
@@ -826,7 +843,7 @@ DASHBOARD_HTML = """
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({worker_concurrency: next})
         });
-        document.getElementById("message").textContent = `Active worker threads set to ${next} in this process.`;
+        document.getElementById("message").textContent = `Desired threads per Worker container set to ${next}. Waiting for Worker heartbeat.`;
         await refresh();
       } catch (error) {
         document.getElementById("message").textContent = `Scale error: ${error.message}`;

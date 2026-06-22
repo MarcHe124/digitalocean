@@ -23,6 +23,7 @@ class Settings(BaseSettings):
         default=5.0, ge=0.5, le=60, validation_alias="LEASE_REAPER_INTERVAL_SECONDS"
     )
     scheduler_interval_seconds: float = Field(default=1.0, ge=0.1, le=60, validation_alias="SCHEDULER_INTERVAL_SECONDS")
+    config_sync_interval_seconds: float = Field(default=1.0, ge=0.1, le=60, validation_alias="CONFIG_SYNC_INTERVAL_SECONDS")
     dashboard_enabled: bool = Field(default=True, validation_alias="DASHBOARD_ENABLED")
     auto_start_worker: bool = Field(default=True, validation_alias="AUTO_START_WORKER")
 

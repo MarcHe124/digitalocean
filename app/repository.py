@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth, ScheduleCreate
+from app.models import AttemptStatus, JobCreate, JobStatus, QueueDepth, RuntimeConfig, RuntimeConfigPatch, ScheduleCreate
 from app.scheduling import next_cron_run
 
 
@@ -42,6 +42,14 @@ def parse_db_time(value: Optional[str]) -> Optional[datetime]:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def merge_runtime_config(current: RuntimeConfig, patch: RuntimeConfigPatch) -> RuntimeConfig:
+    values = current.model_dump()
+    values.update(patch.model_dump(exclude_none=True))
+    values["default_timeout_seconds"] = min(values["default_timeout_seconds"], values["max_timeout_seconds"])
+    values["backoff_base_seconds"] = min(values["backoff_base_seconds"], values["backoff_max_seconds"])
+    return RuntimeConfig(**values)
 
 
 class JobRepository:
@@ -132,6 +140,19 @@ class JobRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_recurring_schedules_due
                     ON recurring_schedules(enabled, next_run_at);
+
+                CREATE TABLE IF NOT EXISTS runtime_config (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    config_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_instances (
+                    instance_id TEXT PRIMARY KEY,
+                    active_threads INTEGER NOT NULL,
+                    busy_threads INTEGER NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
                 """
             )
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
@@ -154,6 +175,70 @@ class JobRepository:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_schedule_occurrence "
                 "ON jobs(schedule_id, scheduled_for) WHERE schedule_id IS NOT NULL"
             )
+
+    def initialize_runtime_config(self, default: RuntimeConfig) -> RuntimeConfig:
+        now = to_db_time(now_utc())
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO runtime_config(id, config_json, updated_at) VALUES (1, ?, ?)",
+                (default.model_dump_json(), now),
+            )
+        return self.get_runtime_config()
+
+    def get_runtime_config(self) -> RuntimeConfig:
+        with self.connect() as conn:
+            row = conn.execute("SELECT config_json FROM runtime_config WHERE id = 1").fetchone()
+        if row is None:
+            raise RuntimeError("runtime configuration is not initialized")
+        return RuntimeConfig.model_validate_json(row["config_json"])
+
+    def patch_runtime_config(self, patch: RuntimeConfigPatch) -> RuntimeConfig:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT config_json FROM runtime_config WHERE id = 1").fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise RuntimeError("runtime configuration is not initialized")
+            updated = merge_runtime_config(RuntimeConfig.model_validate_json(row["config_json"]), patch)
+            conn.execute(
+                "UPDATE runtime_config SET config_json = ?, updated_at = ? WHERE id = 1",
+                (updated.model_dump_json(), to_db_time(now_utc())),
+            )
+            conn.execute("COMMIT")
+        return updated
+
+    def heartbeat_worker(self, instance_id: str, active_threads: int, busy_threads: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_instances(instance_id, active_threads, busy_threads, last_seen_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(instance_id) DO UPDATE SET
+                    active_threads = excluded.active_threads,
+                    busy_threads = excluded.busy_threads,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (instance_id, active_threads, busy_threads, to_db_time(now_utc())),
+            )
+
+    def worker_runtime_status(self, max_age_seconds: float = 10.0) -> Dict[str, int]:
+        cutoff = to_db_time(datetime.fromtimestamp(now_utc().timestamp() - max_age_seconds, tz=timezone.utc))
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS instances,
+                       COALESCE(SUM(active_threads), 0) AS active_threads,
+                       COALESCE(SUM(busy_threads), 0) AS busy_threads
+                FROM worker_instances
+                WHERE last_seen_at >= ?
+                """,
+                (cutoff,),
+            ).fetchone()
+        return {
+            "instances": int(row["instances"]),
+            "active_threads": int(row["active_threads"]),
+            "busy_threads": int(row["busy_threads"]),
+        }
 
     def create_job(
         self,
